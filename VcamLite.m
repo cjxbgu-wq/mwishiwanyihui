@@ -1,5 +1,5 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.3（生产版）
+//  VcamLite.m — 融合版相机替换内核 v1.3.1（生产版）
 //
 //  融合来源：
 //    - vcamplus-msd: 遍历所有子类 hook + 双路径缓存
@@ -12,6 +12,8 @@
 //    P1-4   editTime 合并写 plist
 //    v1.3-P0  LiteProcessor.transfer 的 memcpy 挪进锁内（防撕裂）
 //    v1.3-P1  LiteCore.enabled 副作用挪出锁外（防锁内 dispatch）
+//    v1.3.1   显式 #import <VideoToolbox/VideoToolbox.h>（Theos 编译必需）
+//    v1.3.1   install_thread(void *arg) 加参数名（C99 兼容）
 //
 //  精简掉：卡密 / 拍照 / 反检测 / 三指手势
 //
@@ -23,6 +25,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
+#import <VideoToolbox/VideoToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <stdatomic.h>
@@ -468,7 +471,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
         else { [_lock unlock]; return NO; }
     }
 
-    // v1.3-P0：memcpy 在锁内，防止并发重建时读到半新半旧的 c.buf
     BOOL ok = vmemcpy(c.buf, dst);
     [_lock unlock];
     return ok;
@@ -478,8 +480,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteCore — mediaserverd 侧协调器
-//  P1-3：os_unfair_lock 保护内部状态
-//  v1.3-P1：副作用挪出锁外
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -519,7 +519,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return self;
 }
 
-// v1.3-P1：状态判定在锁内，副作用（start/stop）在锁外
 - (BOOL)enabled {
     CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
     if (now - _lastCheck < 0.5) return _enabledCache;
@@ -727,7 +726,9 @@ static void install_hooks(void) {
     vlog(@"hook", @"emit=%d scaler=%d encoder=%d", n1, n2, n3);
 }
 
-static void *install_thread(void *) {
+// v1.3.1 修复：C99 不允许匿名参数
+static void *install_thread(void *arg) {
+    (void)arg;
     while (1) {
         if (objc_getClass("BWNodeOutput")) { install_hooks(); return NULL; }
         usleep(500 * 1000);
@@ -1041,7 +1042,6 @@ static void *install_thread(void *) {
         if (e <= s) e = s + 0.1;
         int64_t us = (int64_t)llround(s * 1e6);
         int64_t ue = (int64_t)llround(e * 1e6);
-        // P1-4：合并写，避免读到中间态
         vplist_update(^(NSMutableDictionary *d) {
             d[usS] = @(us);
             d[sS]  = @((double)us / 1e6);
