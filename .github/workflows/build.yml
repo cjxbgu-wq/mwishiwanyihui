@@ -1,0 +1,56 @@
+name: Build VcamLite
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    timeout-minutes: 30
+
+    env:
+      THEOS: ${{ github.workspace }}/theos
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Theos
+        id: cache-theos
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/theos
+          key: theos-macos-v4
+
+      - name: Setup Theos
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --recursive --depth 1 https://github.com/theos/theos.git "$THEOS"
+          mkdir -p "$THEOS/sdks"
+
+      - name: Install iOS SDK
+        if: steps.cache-theos.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 https://github.com/theos/sdks.git /tmp/theos-sdks
+          cp -R /tmp/theos-sdks/iPhoneOS15.6.sdk "$THEOS/sdks/" 2>/dev/null || \
+            cp -R /tmp/theos-sdks/iPhoneOS15.5.sdk "$THEOS/sdks/" 2>/dev/null || \
+            cp -R /tmp/theos-sdks/iPhoneOS15.4.sdk "$THEOS/sdks/" 2>/dev/null || true
+          ls "$THEOS/sdks/"
+
+      - name: Install tools
+        run: |
+          brew install ldid dpkg fakeroot
+
+      - name: Build
+        run: |
+          chmod +x build.sh
+          ./build.sh
+
+      - name: Upload deb
+        uses: actions/upload-artifact@v4
+        with:
+          name: VcamLite-deb-${{ github.sha }}
+          path: VcamLite_latest.deb
+          retention-days: 30
