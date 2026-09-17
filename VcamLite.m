@@ -1,5 +1,6 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.9 (视频模式修复)
+//  VcamLite.m — 融合版相机替换内核 v2.0
+//  深度审计版：覆盖所有 CMSampleBuffer 入口，解决录像/延时/慢动作未替换
 //
 
 #import <Foundation/Foundation.h>
@@ -613,7 +614,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     vl_logNewFormat(dst, from);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
-    // ★ 改动 6: Lossy 格式先诊断不跳过（视频模式可能走这些格式）
+    // Lossy 格式：不再跳过，只诊断（v1.9 起）
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
         fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) {
         static NSMutableSet<NSString *> *sSeenLossy = nil;
@@ -626,7 +627,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
         if (first) [sSeenLossy addObject:k];
         [sLL unlock];
         if (first) vlog_always(@"replace", @"HIT lossy 0x%x from=%s (will attempt)", (unsigned)fmt, from);
-        // 不 return，继续尝试
     }
 
     if (!vl_writableBuffer(dst)) {
@@ -708,79 +708,114 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
-// ★ 改动 5: 去掉 mediaType 检查，交给 replaceInPlace 内部判 fd
+// 检查 sampleBuffer 是否已被处理（去重）
+static BOOL vl_is_processed(CMSampleBufferRef sb) {
+    if (!sb) return NO;
+    CFTypeRef p = CMGetAttachment(sb, kVLProcessedKey, NULL);
+    return (p != NULL &&
+            CFGetTypeID(p) == CFBooleanGetTypeID() &&
+            CFBooleanGetValue((CFBooleanRef)p));
+}
+
+static void vl_mark_processed(CMSampleBufferRef sb) {
+    if (!sb) return;
+    CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
+                    kCMAttachmentMode_ShouldPropagate);
+}
+
+// ★ 核心 hook 1：emitSampleBuffer:（保留原逻辑 + 用 Propagate 让下游跳过重复）
 __attribute__((used))
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     @autoreleasepool {
-        if (sb) {
-            CFTypeRef processed = CMGetAttachment(sb, kVLProcessedKey, NULL);
-            BOOL alreadyProcessed = (processed != NULL &&
-                                     CFGetTypeID(processed) == CFBooleanGetTypeID() &&
-                                     CFBooleanGetValue((CFBooleanRef)processed));
-            if (!alreadyProcessed && [LiteCore.shared enabled]) {
-                CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
-                                kCMAttachmentMode_ShouldNotPropagate);
-                @try {
-                    [LiteCore.shared checkActionFromPlist];
-                    NSString *cls = NSStringFromClass(object_getClass(_self));
-                    [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
-                } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
-            }
+        if (sb && !vl_is_processed(sb) && [LiteCore.shared enabled]) {
+            vl_mark_processed(sb);
+            @try {
+                [LiteCore.shared checkActionFromPlist];
+                NSString *cls = NSStringFromClass(object_getClass(_self));
+                [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+            } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
         }
     }
     IMP orig = orig_imp_for_instance(_self);
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
 }
 
+// ★ 核心 hook 2：renderSampleBuffer:forInput:
 __attribute__((used))
 static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     @autoreleasepool {
-        if (sb && [LiteCore.shared enabled]) {
+        if (sb && !vl_is_processed(sb) && [LiteCore.shared enabled]) {
+            vl_mark_processed(sb);
             @try {
                 NSString *cls = NSStringFromClass(object_getClass(_self));
                 [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
-            }
-            @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
+            } @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
         }
     }
     IMP orig = orig_imp_for_instance(_self);
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, input);
 }
 
-// ★ 改动 3: 沿继承链找 owner，用 owner 做 key 去重
+// ★ 新增：通用单参数 CMSampleBufferRef hook（覆盖录像专用方法）
+__attribute__((used))
+static void vl_sb1_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
+    @autoreleasepool {
+        if (sb && !vl_is_processed(sb) && [LiteCore.shared enabled]) {
+            vl_mark_processed(sb);
+            @try {
+                NSString *cls = NSStringFromClass(object_getClass(_self));
+                [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+            } @catch (NSException *e) { vlog(@"sb1", @"exc: %@", e); }
+        }
+    }
+    IMP orig = orig_imp_for_instance(_self);
+    if (orig) ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
+}
+
+// ★ 新增：通用双参数 CMSampleBufferRef hook
+__attribute__((used))
+static void vl_sb2_body(id _self, SEL _cmd, CMSampleBufferRef sb, id arg2) {
+    @autoreleasepool {
+        if (sb && !vl_is_processed(sb) && [LiteCore.shared enabled]) {
+            vl_mark_processed(sb);
+            @try {
+                NSString *cls = NSStringFromClass(object_getClass(_self));
+                [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+            } @catch (NSException *e) { vlog(@"sb2", @"exc: %@", e); }
+        }
+    }
+    IMP orig = orig_imp_for_instance(_self);
+    if (orig) ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, arg2);
+}
+
+// ★ 深度审计：沿继承链找 owns 方法的 owner，用 owner 做 key 去重
 __attribute__((used))
 static BOOL hook_class_method(Class cls, SEL sel, IMP newImp, BOOL requireOwns) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return NO;
 
-    // 沿继承链找第一个真正 owns 该方法的类
     Class owner = cls;
     while (owner && !class_owns_method(owner, sel)) {
         owner = class_getSuperclass(owner);
     }
     if (!owner) return NO;
 
-    // 如果 requireOwns 且传入的 cls 不是 owner，说明 cls 只是继承
-    // 保留 VcamPlus 精华：只在 owns 的类上做 hook（避免误 hook 父类影响无关子类）
-    // 但注意——这里我们已经沿链找到了 owner，owner 一定是 owns 的
-    // 所以实际上 requireOwns 只用来决定"是否允许沿链回溯"，此处始终允许
     (void)requireOwns;
 
-    // 若当前 IMP 已经是我们的 hook，跳过
     IMP curIMP = method_getImplementation(m);
     if (curIMP == newImp) return NO;
 
-    // 以 owner 为 key 记录 orig
     if (!gOrigIMP) gOrigIMP = [NSMutableDictionary new];
     NSValue *key = [NSValue valueWithPointer:(__bridge const void *)owner];
     @synchronized(gOrigIMP) {
-        if (gOrigIMP[key]) return NO;   // owner 已记录 → 跳过
+        if (gOrigIMP[key]) return NO;
         gOrigIMP[key] = [NSValue valueWithPointer:(const void *)curIMP];
     }
     method_setImplementation(m, newImp);
     return YES;
 }
 
+// ★ 保持原：hook BWNodeOutput 及所有子类的 emitSampleBuffer:
 __attribute__((used))
 static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     Class base = objc_getClass(baseName);
@@ -802,7 +837,7 @@ static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     return hooked;
 }
 
-// ★ 改动 4: 同时 hook emit + render（覆盖视频模式）
+// ★ 保持原：遍历所有 BW* 类 hook render 方法
 __attribute__((used))
 static int hook_all_render_classes(void) {
     int hooked = 0;
@@ -828,10 +863,101 @@ static int hook_all_render_classes(void) {
     return hooked;
 }
 
-// ★ 改动 2: 去掉 gInstalled 一次性限制，每次都跑；notify 只注册一次
+// ★★★ 核心新增：判断方法是否含 CMSampleBufferRef 参数
+__attribute__((used))
+static BOOL method_has_cmsb_arg(Method m) {
+    const char *enc = method_getTypeEncoding(m);
+    if (!enc) return NO;
+    return strstr(enc, "opaqueCMSampleBuffer") != NULL;
+}
+
+// ★★★ 核心新增：数方法参数个数（按冒号数）
+__attribute__((used))
+static int method_argc(Method m) {
+    SEL sel = method_getName(m);
+    const char *sn = sel_getName(sel);
+    int argc = 0;
+    for (const char *p = sn; *p; p++) if (*p == ':') argc++;
+    return argc;
+}
+
+// ★★★ 核心新增：遍历所有 BW* 类，hook 所有含 CMSampleBufferRef 参数的方法
+__attribute__((used))
+static int hook_all_sb_methods(void) {
+    int hooked = 0;
+    unsigned int total = 0;
+    Class *all = objc_copyClassList(&total);
+    for (unsigned int i = 0; i < total; i++) {
+        Class c = all[i];
+        const char *name = class_getName(c);
+        if (!strstr(name, "BW")) continue;
+
+        unsigned int n = 0;
+        Method *list = class_copyMethodList(c, &n);
+        for (unsigned int j = 0; j < n; j++) {
+            Method m = list[j];
+            if (!method_has_cmsb_arg(m)) continue;
+
+            SEL sel = method_getName(m);
+            const char *sn = sel_getName(sel);
+
+            // 跳过已由 vl_emit_body / vl_render_body 处理的
+            if (strcmp(sn, "emitSampleBuffer:") == 0) continue;
+            if (strcmp(sn, "renderSampleBuffer:forInput:") == 0) continue;
+
+            int argc = method_argc(m);
+            IMP newImp = NULL;
+            if (argc == 1) newImp = (IMP)vl_sb1_body;
+            else if (argc == 2) newImp = (IMP)vl_sb2_body;
+            else continue;
+
+            if (hook_class_method(c, sel, newImp, YES)) {
+                vlog_always(@"hook-sb", @"%s -> %s (argc=%d)", name, sn, argc);
+                hooked++;
+            }
+        }
+        if (list) free(list);
+    }
+    if (all) free(all);
+    return hooked;
+}
+
+// ★ 一次性诊断：打印所有 BW* 类中含 buffer/emit/render/encode 的方法
+__attribute__((used))
+static void dump_bw_methods(void) {
+    static BOOL sDone = NO;
+    if (sDone) return;
+    sDone = YES;
+    vlog_always(@"dump", @"===== BW methods dump start =====");
+    unsigned int total = 0;
+    Class *all = objc_copyClassList(&total);
+    for (unsigned int i = 0; i < total; i++) {
+        Class c = all[i];
+        const char *name = class_getName(c);
+        if (!strstr(name, "BW")) continue;
+
+        unsigned int n = 0;
+        Method *list = class_copyMethodList(c, &n);
+        for (unsigned int j = 0; j < n; j++) {
+            const char *sn = sel_getName(method_getName(list[j]));
+            if (strstr(sn, "uffer") || strstr(sn, "emit") ||
+                strstr(sn, "render") || strstr(sn, "ncode") ||
+                strstr(sn, "rite") || strstr(sn, "onsume") ||
+                strstr(sn, "rocess") || strstr(sn, "eceive") ||
+                strstr(sn, "apture")) {
+                const char *enc = method_getTypeEncoding(list[j]);
+                vlog_always(@"dump", @"%s -> %s | %s", name, sn, enc ? enc : "?");
+            }
+        }
+        if (list) free(list);
+    }
+    free(all);
+    vlog_always(@"dump", @"===== BW methods dump end =====");
+}
+
+// ★ 保持 v1.9：去掉一次性限制
 __attribute__((used))
 static void install_hooks(void) {
-    // 每次 install 尝试都扫描并 hook（hook_class_method 内部去重）
     int n1 = hook_all_subclasses("BWNodeOutput",
                 @selector(emitSampleBuffer:), (IMP)vl_emit_body);
     int n2 = hook_all_subclasses("BWStillImageScalerNode",
@@ -839,13 +965,18 @@ static void install_hooks(void) {
     int n3 = hook_all_subclasses("BWPhotoEncoderNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
     int n4 = hook_all_render_classes();
+    // ★ 核心：遍历所有含 CMSampleBuffer 的方法
+    int n5 = hook_all_sb_methods();
 
-    if (n1 + n2 + n3 + n4 > 0) {
-        vlog_always(@"hook", @"new pass: emit=%d scaler=%d encoder=%d generic=%d",
-                    n1, n2, n3, n4);
+    if (n1 + n2 + n3 + n4 + n5 > 0) {
+        vlog_always(@"hook", @"new pass: emit=%d scaler=%d encoder=%d generic=%d sb-methods=%d",
+                    n1, n2, n3, n4, n5);
     }
 
-    // notify 只注册一次（用 gInstalled 作为标志）
+    // 一次性诊断
+    dump_bw_methods();
+
+    // notify 只注册一次
     if (atomic_exchange(&gInstalled, 1) == 0) {
         int token = -1;
         notify_register_dispatch(kNotifyAction, &token,
@@ -861,7 +992,7 @@ static void install_hooks(void) {
     }
 }
 
-// ★ 改动 1: 永久循环，每 1 秒重扫
+// ★ 保持 v1.9：永久循环
 __attribute__((used))
 static void *install_thread(void *arg) {
     (void)arg;
@@ -877,7 +1008,7 @@ static void *install_thread(void *arg) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  UI 层
+//  UI 层（完全保持原样）
 // ══════════════════════════════════════════════════════════════════════
 @interface VLWindow : UIWindow @end
 @implementation VLWindow
