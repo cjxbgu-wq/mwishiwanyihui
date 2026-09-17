@@ -1,0 +1,9 @@
+Package: com.vcam.lite
+Name: VcamLite
+Version: 1.3.0
+Architecture: iphoneos-arm64e
+Description: Camera replacement tool (lite, v1.3)
+Maintainer: vcam
+Author: vcam
+Section: Tweaks
+Depends: mobilesubstrate
