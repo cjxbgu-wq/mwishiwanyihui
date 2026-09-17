@@ -1,5 +1,5 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.8
+//  VcamLite.m — 融合版相机替换内核 v1.9 (视频模式修复)
 //
 
 #import <Foundation/Foundation.h>
@@ -613,13 +613,22 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     vl_logNewFormat(dst, from);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
-    // 只跳过 lossy（数据错乱风险）
+    // ★ 改动 6: Lossy 格式先诊断不跳过（视频模式可能走这些格式）
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
         fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) {
-        return;
+        static NSMutableSet<NSString *> *sSeenLossy = nil;
+        static NSLock *sLL = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{ sSeenLossy = [NSMutableSet new]; sLL = [NSLock new]; });
+        NSString *k = [NSString stringWithFormat:@"%s_0x%x", from, (unsigned)fmt];
+        [sLL lock];
+        BOOL first = ![sSeenLossy containsObject:k];
+        if (first) [sSeenLossy addObject:k];
+        [sLL unlock];
+        if (first) vlog_always(@"replace", @"HIT lossy 0x%x from=%s (will attempt)", (unsigned)fmt, from);
+        // 不 return，继续尝试
     }
 
-    // 可写检查：只警告，不跳过
     if (!vl_writableBuffer(dst)) {
         static NSMutableSet<NSString *> *sWarn = nil;
         static NSLock *sWL = nil;
@@ -633,7 +642,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
         if (first) [sWarn addObject:k];
         [sWL unlock];
         if (first) vlog_always(@"replace", @"WARN non-writable %zux%zu fmt=0x%x from=%s", w, h, (unsigned)fmt, from);
-        // 继续尝试
     }
 
     uint64_t srcID = [_dec latestFrameID];
@@ -641,7 +649,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     CVPixelBufferRef src = [_dec latestFrameRetained];
     if (!src) return;
 
-    // 替换结果诊断（每格式一次）
     static NSMutableSet<NSString *> *sDone = nil;
     static NSLock *sDL = nil;
     static dispatch_once_t once2;
@@ -701,6 +708,7 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
+// ★ 改动 5: 去掉 mediaType 检查，交给 replaceInPlace 内部判 fd
 __attribute__((used))
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     @autoreleasepool {
@@ -714,16 +722,8 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
                                 kCMAttachmentMode_ShouldNotPropagate);
                 @try {
                     [LiteCore.shared checkActionFromPlist];
-                    SEL mtSel = sel_registerName("mediaType");
-                    BOOL isVideo = YES;
-                    if ([_self respondsToSelector:mtSel]) {
-                        uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
-                        if (mt != 'vide') isVideo = NO;
-                    }
-                    if (isVideo) {
-                        NSString *cls = NSStringFromClass(object_getClass(_self));
-                        [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
-                    }
+                    NSString *cls = NSStringFromClass(object_getClass(_self));
+                    [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
                 } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
             }
         }
@@ -747,16 +747,35 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, input);
 }
 
+// ★ 改动 3: 沿继承链找 owner，用 owner 做 key 去重
 __attribute__((used))
 static BOOL hook_class_method(Class cls, SEL sel, IMP newImp, BOOL requireOwns) {
     Method m = class_getInstanceMethod(cls, sel);
     if (!m) return NO;
-    if (requireOwns && !class_owns_method(cls, sel)) return NO;
-    IMP orig = method_getImplementation(m);
+
+    // 沿继承链找第一个真正 owns 该方法的类
+    Class owner = cls;
+    while (owner && !class_owns_method(owner, sel)) {
+        owner = class_getSuperclass(owner);
+    }
+    if (!owner) return NO;
+
+    // 如果 requireOwns 且传入的 cls 不是 owner，说明 cls 只是继承
+    // 保留 VcamPlus 精华：只在 owns 的类上做 hook（避免误 hook 父类影响无关子类）
+    // 但注意——这里我们已经沿链找到了 owner，owner 一定是 owns 的
+    // 所以实际上 requireOwns 只用来决定"是否允许沿链回溯"，此处始终允许
+    (void)requireOwns;
+
+    // 若当前 IMP 已经是我们的 hook，跳过
+    IMP curIMP = method_getImplementation(m);
+    if (curIMP == newImp) return NO;
+
+    // 以 owner 为 key 记录 orig
     if (!gOrigIMP) gOrigIMP = [NSMutableDictionary new];
+    NSValue *key = [NSValue valueWithPointer:(__bridge const void *)owner];
     @synchronized(gOrigIMP) {
-        gOrigIMP[[NSValue valueWithPointer:(__bridge const void *)cls]] =
-            [NSValue valueWithPointer:(const void *)orig];
+        if (gOrigIMP[key]) return NO;   // owner 已记录 → 跳过
+        gOrigIMP[key] = [NSValue valueWithPointer:(const void *)curIMP];
     }
     method_setImplementation(m, newImp);
     return YES;
@@ -783,7 +802,7 @@ static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     return hooked;
 }
 
-// ★ 通用：hook 所有实现 renderSampleBuffer:forInput: 的 BW* 类
+// ★ 改动 4: 同时 hook emit + render（覆盖视频模式）
 __attribute__((used))
 static int hook_all_render_classes(void) {
     int hooked = 0;
@@ -793,9 +812,15 @@ static int hook_all_render_classes(void) {
         Class c = all[i];
         const char *name = class_getName(c);
         if (!strstr(name, "BW")) continue;
+
         if (hook_class_method(c, @selector(renderSampleBuffer:forInput:),
                               (IMP)vl_render_body, YES)) {
             vlog_always(@"hook", @"+render: %s", name);
+            hooked++;
+        }
+        if (hook_class_method(c, @selector(emitSampleBuffer:),
+                              (IMP)vl_emit_body, YES)) {
+            vlog_always(@"hook", @"+emit: %s", name);
             hooked++;
         }
     }
@@ -803,70 +828,50 @@ static int hook_all_render_classes(void) {
     return hooked;
 }
 
+// ★ 改动 2: 去掉 gInstalled 一次性限制，每次都跑；notify 只注册一次
 __attribute__((used))
 static void install_hooks(void) {
-    if (atomic_exchange(&gInstalled, 1)) return;
-
-    // 诊断：列出所有含 emit 或 render 的 BW 类
-    {
-        unsigned int total = 0;
-        Class *all = objc_copyClassList(&total);
-        int emitCnt = 0, renderCnt = 0;
-        for (unsigned int i = 0; i < total; i++) {
-            Class c = all[i];
-            const char *name = class_getName(c);
-            if (!strstr(name, "BW")) continue;
-
-            BOOL ownsEmit = NO, ownsRender = NO;
-            unsigned int n = 0;
-            Method *list = class_copyMethodList(c, &n);
-            for (unsigned int j = 0; j < n; j++) {
-                SEL s = method_getName(list[j]);
-                const char *sn = sel_getName(s);
-                if (strcmp(sn, "emitSampleBuffer:") == 0) ownsEmit = YES;
-                if (strcmp(sn, "renderSampleBuffer:forInput:") == 0) ownsRender = YES;
-            }
-            if (list) free(list);
-
-            if (ownsEmit) { vlog_always(@"classes", @"EMIT: %s", name); emitCnt++; }
-            if (ownsRender) { vlog_always(@"classes", @"RENDER: %s", name); renderCnt++; }
-        }
-        free(all);
-        vlog_always(@"classes", @"summary: EMIT=%d RENDER=%d", emitCnt, renderCnt);
-    }
-
-    // 原有 hook
+    // 每次 install 尝试都扫描并 hook（hook_class_method 内部去重）
     int n1 = hook_all_subclasses("BWNodeOutput",
                 @selector(emitSampleBuffer:), (IMP)vl_emit_body);
     int n2 = hook_all_subclasses("BWStillImageScalerNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
     int n3 = hook_all_subclasses("BWPhotoEncoderNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
-    // 通用 render hook
     int n4 = hook_all_render_classes();
 
-    vlog_always(@"hook", @"emit=%d scaler=%d encoder=%d generic-render=%d",
-                n1, n2, n3, n4);
+    if (n1 + n2 + n3 + n4 > 0) {
+        vlog_always(@"hook", @"new pass: emit=%d scaler=%d encoder=%d generic=%d",
+                    n1, n2, n3, n4);
+    }
 
-    int token = -1;
-    notify_register_dispatch(kNotifyAction, &token,
-        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
-        ^(int t) {
-            @autoreleasepool {
-                if ([LiteCore.shared enabled]) {
-                    [LiteCore.shared checkActionFromPlist];
+    // notify 只注册一次（用 gInstalled 作为标志）
+    if (atomic_exchange(&gInstalled, 1) == 0) {
+        int token = -1;
+        notify_register_dispatch(kNotifyAction, &token,
+            dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+            ^(int t) {
+                @autoreleasepool {
+                    if ([LiteCore.shared enabled]) {
+                        [LiteCore.shared checkActionFromPlist];
+                    }
                 }
-            }
-        });
-    vlog(@"hook", @"notify registered (token=%d)", token);
+            });
+        vlog(@"hook", @"notify registered (token=%d)", token);
+    }
 }
 
+// ★ 改动 1: 永久循环，每 1 秒重扫
 __attribute__((used))
 static void *install_thread(void *arg) {
     (void)arg;
     while (1) {
-        if (objc_getClass("BWNodeOutput")) { install_hooks(); return NULL; }
-        usleep(500 * 1000);
+        @autoreleasepool {
+            if (objc_getClass("BWNodeOutput")) {
+                install_hooks();
+            }
+        }
+        sleep(1);
     }
     return NULL;
 }
