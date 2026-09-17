@@ -1,17 +1,11 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.5
+//  VcamLite.m — 融合版相机替换内核 v1.7
 //
-//  历史修复：
-//    P0-1   vplist_cached 用纳秒精度
-//    P0-2   decoder 用 generation counter 保证 loop 唯一
-//    P1-3   LiteCore 加 os_unfair_lock 保证多线程安全
-//    P1-4   editTime 合并写 plist
-//    v1.3-P0  LiteProcessor.transfer 的 memcpy 挪进锁内（防撕裂）
-//    v1.3-P1  LiteCore.enabled 副作用挪出锁外（防锁内 dispatch）
-//    v1.3.1   显式 #import <VideoToolbox/VideoToolbox.h>
-//    v1.3.1   install_thread(void *arg) 加参数名（C99 兼容）
-//    v1.4     修复动作抢占（区分 reader 自然完成 vs 被打断）
-//    v1.5     面板改为两 Tab：控制 / 时间；动作按钮放入控制页
+//  v1.7 修复：
+//    A. 用 CMSetAttachment 防止父类/子类双重替换（视频/慢动作黑屏根因）
+//    B. 格式白名单（只处理已知安全格式）
+//    C. IOSurface 可写检查
+//    D. 首次见 (w,h,fmt) 日志
 //
 
 #import <Foundation/Foundation.h>
@@ -31,12 +25,14 @@
 #import <dlfcn.h>
 #import <pthread.h>
 #import <math.h>
+#import <notify.h>
 
 // ══════════════════════════════════════════════════════════════════════
 //  常量
 // ══════════════════════════════════════════════════════════════════════
 static NSString *const kVideoPath = @"/var/mobile/Media/DCIM/vcam.mp4";
 static NSString *const kPlistPath = @"/var/mobile/Media/DCIM/vc.plist";
+static const char *const kNotifyAction = "com.vlite.action.changed";
 
 static NSString *const kEnableKey     = @"enabled";
 static NSString *const kActionToken   = @"actionToken";
@@ -62,8 +58,11 @@ static const int64_t kMouthEndDefUs   = 3500000LL;
 static const int64_t kHeadStartDefUs  = 4000000LL;
 static const int64_t kHeadEndDefUs    = 5500000LL;
 
+// v1.7：attachment key 用于防双重替换
+static CFStringRef const kVLProcessedKey = CFSTR("com.vlite.processed");
+
 // ══════════════════════════════════════════════════════════════════════
-//  日志（按 tag 限流）
+//  日志
 // ══════════════════════════════════════════════════════════════════════
 static void vlog(NSString *tag, NSString *fmt, ...) {
     static NSMutableDictionary<NSString *, NSNumber *> *sLastByTag = nil;
@@ -83,6 +82,14 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
     sLastByTag[tag] = @(now);
     [sLock unlock];
 
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[vlite][%@] %@", tag, m);
+}
+
+// v1.7：不节流的日志（用于诊断首次见格式）
+static void vlog_always(NSString *tag, NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -122,6 +129,7 @@ static void vplist_update(void (^block)(NSMutableDictionary *)) {
         block(d);
         [d writeToFile:kPlistPath atomically:YES];
     }
+    notify_post(kNotifyAction);
 }
 
 static BOOL vplist_enabled(void) {
@@ -142,6 +150,67 @@ static int64_t vplist_get_us(NSDictionary *pl, NSString *usKey,
     n = pl[secKey];
     if (n) return (int64_t)llround([n doubleValue] * 1000000.0);
     return defUs;
+}
+
+// ══════════════════════════════════════════════════════════════════════
+//  v1.7：格式白名单 + 可写检查
+// ══════════════════════════════════════════════════════════════════════
+
+// 只处理已知安全的目标格式
+static BOOL vl_supportedFormat(OSType fmt) {
+    switch (fmt) {
+        case kCVPixelFormatType_32BGRA:                          // 'BGRA'
+        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:    // '420v'
+        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:     // '420f'
+            return YES;
+        default:
+            // 'x420' = 10-bit 420 video range
+            if (fmt == 0x78343230) return YES;
+            // 'xf20' = 10-bit 420 full range
+            if (fmt == 0x78663230) return YES;
+            return NO;
+    }
+}
+
+// 检查目标 buffer 是否可写（有 IOSurface 绑定）
+static BOOL vl_writableBuffer(CVPixelBufferRef pb) {
+    if (!pb) return NO;
+    IOSurfaceRef surf = CVPixelBufferGetIOSurface(pb);
+    if (!surf) return NO;
+    return YES;
+}
+
+// v1.7：首次见 (w, h, fmt) 时打印一次
+static void vl_logNewFormat(CVPixelBufferRef dst) {
+    static NSMutableSet<NSString *> *sSeen = nil;
+    static NSLock *sLock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        sSeen = [NSMutableSet new];
+        sLock = [NSLock new];
+    });
+
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    OSType fmt = CVPixelBufferGetPixelFormatType(dst);
+    char fcc[5] = {0};
+    fcc[0] = (fmt >> 24) & 0xff;
+    fcc[1] = (fmt >> 16) & 0xff;
+    fcc[2] = (fmt >> 8) & 0xff;
+    fcc[3] = fmt & 0xff;
+    NSString *key = [NSString stringWithFormat:@"%zux%zu_%s", w, h, fcc];
+
+    [sLock lock];
+    BOOL first = ![sSeen containsObject:key];
+    if (first) [sSeen addObject:key];
+    [sLock unlock];
+
+    if (first) {
+        IOSurfaceRef surf = CVPixelBufferGetIOSurface(dst);
+        vlog_always(@"replace",
+            @"NEW FORMAT: %zux%zu '%s' (0x%08x) surface=%p",
+            w, h, fcc, (unsigned)fmt, surf);
+    }
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -330,7 +399,6 @@ typedef NS_ENUM(int, VLState) {
             }
             [reader cancelReading];
 
-            // v1.4：区分"自然完成"和"被打断"
             int curState = atomic_load(&_state);
             BOOL interrupted = (curState != (int)st) ||
                                (atomic_load(&_actionDirty) != 0);
@@ -453,7 +521,12 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (c.srcID != srcID) {
         OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, c.buf);
         if (s == noErr) c.srcID = srcID;
-        else { [_lock unlock]; return NO; }
+        else {
+            // v1.7：VT 转换失败，c.buf 状态未知，标记 srcID = 0 强制下次重建
+            c.srcID = 0;
+            [_lock unlock];
+            return NO;
+        }
     }
 
     BOOL ok = vmemcpy(c.buf, dst);
@@ -470,6 +543,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 + (instancetype)shared;
 - (BOOL)enabled;
 - (void)replaceInPlace:(CMSampleBufferRef)sb;
+- (void)checkActionFromPlist;
 @end
 
 @implementation LiteCore {
@@ -580,9 +654,39 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
     if (!dst) return;
 
+    // v1.7：先打印一次这个格式（诊断用）
+    vl_logNewFormat(dst);
+
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
+
+    // v1.7：只处理已知安全的格式
+    if (!vl_supportedFormat(fmt)) return;
+
+    // v1.7：跳过 lossy 格式（-8v0 / -8f0 / -xv0 / -xf0 / -420）
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
         fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) return;
+
+    // v1.7：检查 dst 是否可写
+    if (!vl_writableBuffer(dst)) {
+        static NSMutableSet<NSString *> *sWarned = nil;
+        static NSLock *sWLock = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            sWarned = [NSMutableSet new];
+            sWLock = [NSLock new];
+        });
+        size_t w = CVPixelBufferGetWidth(dst);
+        size_t h = CVPixelBufferGetHeight(dst);
+        NSString *k = [NSString stringWithFormat:@"%zux%zu_%u", w, h, (unsigned)fmt];
+        [sWLock lock];
+        BOOL first = ![sWarned containsObject:k];
+        if (first) [sWarned addObject:k];
+        [sWLock unlock];
+        if (first) {
+            vlog_always(@"replace", @"SKIP non-writable %zux%zu fmt=0x%x", w, h, (unsigned)fmt);
+        }
+        return;
+    }
 
     uint64_t srcID = [_dec latestFrameID];
     if (srcID == 0) return;
@@ -631,19 +735,33 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  v1.7：emit hook（用 attachment 防止双重替换）
+// ══════════════════════════════════════════════════════════════════════
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     @autoreleasepool {
-        if (sb && [LiteCore.shared enabled]) {
-            @try {
-                [LiteCore.shared checkActionFromPlist];
-                SEL mtSel = sel_registerName("mediaType");
-                BOOL isVideo = YES;
-                if ([_self respondsToSelector:mtSel]) {
-                    uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
-                    if (mt != 'vide') isVideo = NO;
-                }
-                if (isVideo) [LiteCore.shared replaceInPlace:sb];
-            } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
+        if (sb) {
+            // v1.7：检查是否已处理过（父类 + 子类双重 hook 场景）
+            CFBooleanRef processed = (CFBooleanRef)CMSampleBufferGetAttachment(
+                sb, kVLProcessedKey, NULL);
+            BOOL alreadyProcessed = (processed && CFBooleanGetValue(processed));
+
+            if (!alreadyProcessed && [LiteCore.shared enabled]) {
+                // 打标记（不传播到下游）
+                CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
+                                kCMAttachmentMode_ShouldNotPropagate);
+
+                @try {
+                    [LiteCore.shared checkActionFromPlist];
+                    SEL mtSel = sel_registerName("mediaType");
+                    BOOL isVideo = YES;
+                    if ([_self respondsToSelector:mtSel]) {
+                        uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
+                        if (mt != 'vide') isVideo = NO;
+                    }
+                    if (isVideo) [LiteCore.shared replaceInPlace:sb];
+                } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
+            }
         }
     }
     IMP orig = orig_imp_for_instance(_self);
@@ -704,7 +822,19 @@ static void install_hooks(void) {
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
     int n3 = hook_all_subclasses("BWPhotoEncoderNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
-    vlog(@"hook", @"emit=%d scaler=%d encoder=%d", n1, n2, n3);
+    vlog_always(@"hook", @"emit=%d scaler=%d encoder=%d", n1, n2, n3);
+
+    int token = -1;
+    notify_register_dispatch(kNotifyAction, &token,
+        dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0),
+        ^(int t) {
+            @autoreleasepool {
+                if ([LiteCore.shared enabled]) {
+                    [LiteCore.shared checkActionFromPlist];
+                }
+            }
+        });
+    vlog(@"hook", @"notify registered (token=%d)", token);
 }
 
 static void *install_thread(void *arg) {
@@ -813,43 +943,46 @@ static void *install_thread(void *arg) {
     c.y = MAX(hh, MIN(_win.frame.size.height - hh, c.y));
     _ball.center = c;
     [g setTranslation:CGPointZero inView:_win];
+    [self updatePanelPosition];
 }
 
-// ══════════════════════════════════════════════════════════════════════
-//  两 Tab 面板：控制 / 时间
-// ══════════════════════════════════════════════════════════════════════
-- (void)showPanel {
-    CGFloat w = 240;
-    CGFloat pad = 10;
-    CGFloat tabH = 36;
-    CGFloat tabGap = 6;
-    CGFloat rowH = 40;
-    CGFloat rowGap = 6;
-
-    // 控制页 6 行（选择视频 / 禁用 / 眨 / 嘴 / 头 / 退出动作）
-    CGFloat contentH = 6 * rowH + 5 * rowGap;
-    CGFloat h = pad + tabH + tabGap + contentH + pad;
-
+- (void)updatePanelPosition {
+    if (!_panel || !_ball || !_win) return;
+    CGFloat w = _panel.frame.size.width;
+    CGFloat h = _panel.frame.size.height;
     CGFloat px = _ball.frame.origin.x - w - 8;
     if (px < 5) px = CGRectGetMaxX(_ball.frame) + 8;
     if (px + w > _win.frame.size.width - 5) px = 5;
     CGFloat py = _ball.center.y - h / 2;
     if (py < 5) py = 5;
     if (py + h > _win.frame.size.height - 5) py = _win.frame.size.height - h - 5;
+    _panel.frame = CGRectMake(px, py, w, h);
+}
 
-    _panel = [[UIView alloc] initWithFrame:CGRectMake(px, py, w, h)];
+- (void)showPanel {
+    CGFloat w = 240;
+    CGFloat pad = 10;
+    CGFloat tabH = 36;
+    CGFloat tabGap = 6;
+    CGFloat rowGap = 6;
+
+    CGFloat controlH = 40 + rowGap + 48 + rowGap + 36;
+    CGFloat timeH = 3 * 40 + 2 * rowGap;
+    CGFloat contentH = MAX(controlH, timeH);
+
+    CGFloat h = pad + tabH + tabGap + contentH + pad;
+
+    _panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _panel.backgroundColor = [UIColor colorWithRed:0.24 green:0.25 blue:0.27 alpha:0.96];
     _panel.layer.cornerRadius = 12;
     _panel.layer.masksToBounds = YES;
 
-    // ── Tab 行（2 个等宽）──
     CGFloat tabW = (w - 2 * pad - tabGap) / 2.0;
     _tabControlBtn = [self makeTab:@"控制" x:pad y:pad w:tabW h:tabH tag:0];
     _tabTimeBtn    = [self makeTab:@"时间" x:pad + tabW + tabGap y:pad w:tabW h:tabH tag:1];
     [_panel addSubview:_tabControlBtn];
     [_panel addSubview:_tabTimeBtn];
 
-    // ── 内容区（两页重叠）──
     CGFloat contentY = pad + tabH + tabGap;
     CGFloat contentW = w - 2 * pad;
     CGRect contentFrame = CGRectMake(pad, contentY, contentW, contentH);
@@ -864,6 +997,8 @@ static void *install_thread(void *arg) {
     [_panel addSubview:_pageTime];
 
     [self switchToTab:_currentTab];
+
+    [self updatePanelPosition];
     [_win addSubview:_panel];
 }
 
@@ -902,9 +1037,9 @@ static void *install_thread(void *arg) {
     _tabTimeBtn.backgroundColor    = (tab == 1) ? active : inactive;
 }
 
-- (UIButton *)makeBtn:(NSString *)t y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h {
+- (UIButton *)makeBtnAt:(NSString *)t x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(0, y, w, h);
+    b.frame = CGRectMake(x, y, w, h);
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
@@ -913,47 +1048,54 @@ static void *install_thread(void *arg) {
     return b;
 }
 
-// ── 控制页：选择视频 / 禁用相机 / 眨 / 嘴 / 头 / 退出动作 ──
 - (void)fillControlPage {
     CGFloat w = _pageControl.bounds.size.width;
-    CGFloat rowH = 40;
     CGFloat gap = 6;
     CGFloat y = 0;
 
-    UIButton *pick = [self makeBtn:@"选择视频" y:y w:w h:rowH];
+    CGFloat row1H = 40;
+    CGFloat halfW = (w - gap) / 2.0;
+
+    UIButton *pick = [self makeBtnAt:@"选择视频" x:0 y:y w:halfW h:row1H];
     [pick addTarget:self action:@selector(pickVideo) forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:pick];
-    y += rowH + gap;
 
     BOOL en = vplist_enabled();
-    _toggleBtn = [self makeBtn:(en ? @"禁用相机" : @"启用相机") y:y w:w h:rowH];
+    _toggleBtn = [self makeBtnAt:(en ? @"禁用相机" : @"启用相机")
+                              x:halfW + gap y:y w:halfW h:row1H];
     [_toggleBtn addTarget:self action:@selector(toggleEnabled:)
          forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:_toggleBtn];
-    y += rowH + gap;
 
-    UIButton *bk = [self makeBtn:@"眨" y:y w:w h:rowH];
+    y += row1H + gap;
+
+    CGFloat row2H = 48;
+    CGFloat thirdW = (w - gap * 2) / 3.0;
+
+    UIButton *bk = [self makeBtnAt:@"眨" x:0 y:y w:thirdW h:row2H];
+    bk.titleLabel.font = [UIFont boldSystemFontOfSize:22];
     [bk addTarget:self action:@selector(actionBlink) forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:bk];
-    y += rowH + gap;
 
-    UIButton *mh = [self makeBtn:@"嘴" y:y w:w h:rowH];
+    UIButton *mh = [self makeBtnAt:@"嘴" x:thirdW + gap y:y w:thirdW h:row2H];
+    mh.titleLabel.font = [UIFont boldSystemFontOfSize:22];
     [mh addTarget:self action:@selector(actionMouth) forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:mh];
-    y += rowH + gap;
 
-    UIButton *hd = [self makeBtn:@"头" y:y w:w h:rowH];
+    UIButton *hd = [self makeBtnAt:@"头" x:(thirdW + gap) * 2 y:y w:thirdW h:row2H];
+    hd.titleLabel.font = [UIFont boldSystemFontOfSize:22];
     [hd addTarget:self action:@selector(actionHead) forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:hd];
-    y += rowH + gap;
 
-    UIButton *ex = [self makeBtn:@"退出动作" y:y w:w h:rowH];
+    y += row2H + gap;
+
+    CGFloat row3H = 36;
+    UIButton *ex = [self makeBtnAt:@"退出动作" x:0 y:y w:w h:row3H];
     ex.backgroundColor = [UIColor colorWithRed:0.55 green:0.30 blue:0.30 alpha:1];
     [ex addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
     [_pageControl addSubview:ex];
 }
 
-// ── 时间页：眨时间 / 嘴时间 / 头时间 ──
 - (void)fillTimePage {
     CGFloat w = _pageTime.bounds.size.width;
     CGFloat rowH = 40;
@@ -963,7 +1105,7 @@ static void *install_thread(void *arg) {
     NSString *titles[3] = {@"眨时间", @"嘴时间", @"头时间"};
     SEL sels[3] = {@selector(timeBlink), @selector(timeMouth), @selector(timeHead)};
     for (int i = 0; i < 3; i++) {
-        UIButton *b = [self makeBtn:titles[i] y:y w:w h:rowH];
+        UIButton *b = [self makeBtnAt:titles[i] x:0 y:y w:w h:rowH];
         [b addTarget:self action:sels[i] forControlEvents:UIControlEventTouchUpInside];
         [_pageTime addSubview:b];
         y += rowH + gap;
@@ -1099,7 +1241,7 @@ static void vcamLite_init(void) {
         NSString *proc = [NSProcessInfo processInfo].processName;
 
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog(@"init", @"loaded in mediaserverd");
+            vlog_always(@"init", @"loaded in mediaserverd");
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
