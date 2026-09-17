@@ -1,5 +1,5 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.7.2
+//  VcamLite.m — 融合版相机替换内核 v1.8
 //
 
 #import <Foundation/Foundation.h>
@@ -57,6 +57,14 @@ static CFStringRef const kVLProcessedKey = CFSTR("com.vlite.processed");
 // ══════════════════════════════════════════════════════════════════════
 //  日志
 // ══════════════════════════════════════════════════════════════════════
+__attribute__((used))
+static void vlog_always(NSString *tag, NSString *fmt, ...) {
+    va_list ap; va_start(ap, fmt);
+    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSLog(@"[vlite][%@] %@", tag, m);
+}
+
 static void vlog(NSString *tag, NSString *fmt, ...) {
     static NSMutableDictionary<NSString *, NSNumber *> *sLast = nil;
     static NSLock *sLock = nil;
@@ -75,14 +83,6 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
     sLast[tag] = @(now);
     [sLock unlock];
 
-    va_list ap; va_start(ap, fmt);
-    NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
-    va_end(ap);
-    NSLog(@"[vlite][%@] %@", tag, m);
-}
-
-__attribute__((used))
-static void vlog_always(NSString *tag, NSString *fmt, ...) {
     va_list ap; va_start(ap, fmt);
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
@@ -151,22 +151,8 @@ static int64_t vplist_get_us(NSDictionary *pl, NSString *usKey,
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  格式白名单 + 可写检查 + 首次日志
+//  可写检查 + 首次日志
 // ══════════════════════════════════════════════════════════════════════
-__attribute__((used))
-static BOOL vl_supportedFormat(OSType fmt) {
-    switch (fmt) {
-        case kCVPixelFormatType_32BGRA:
-        case kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange:
-        case kCVPixelFormatType_420YpCbCr8BiPlanarFullRange:
-            return YES;
-        default:
-            if (fmt == 0x78343230) return YES;
-            if (fmt == 0x78663230) return YES;
-            return NO;
-    }
-}
-
 __attribute__((used))
 static BOOL vl_writableBuffer(CVPixelBufferRef pb) {
     if (!pb) return NO;
@@ -174,7 +160,7 @@ static BOOL vl_writableBuffer(CVPixelBufferRef pb) {
 }
 
 __attribute__((used))
-static void vl_logNewFormat(CVPixelBufferRef dst) {
+static void vl_logNewFormat(CVPixelBufferRef dst, const char *from) {
     static NSMutableSet<NSString *> *sSeen = nil;
     static NSLock *sLock = nil;
     static dispatch_once_t once;
@@ -190,15 +176,15 @@ static void vl_logNewFormat(CVPixelBufferRef dst) {
     fcc[1] = (fmt >> 16) & 0xff;
     fcc[2] = (fmt >> 8) & 0xff;
     fcc[3] = fmt & 0xff;
-    NSString *key = [NSString stringWithFormat:@"%zux%zu_%s", w, h, fcc];
+    NSString *key = [NSString stringWithFormat:@"%s_%zux%zu_%s", from, w, h, fcc];
     [sLock lock];
     BOOL first = ![sSeen containsObject:key];
     if (first) [sSeen addObject:key];
     [sLock unlock];
     if (first) {
         IOSurfaceRef surf = CVPixelBufferGetIOSurface(dst);
-        vlog_always(@"replace", @"NEW FORMAT: %zux%zu '%s' (0x%08x) surface=%p",
-                    w, h, fcc, (unsigned)fmt, surf);
+        vlog_always(@"replace", @"NEW[%s] %zux%zu '%s' (0x%08x) surface=%p",
+                    from, w, h, fcc, (unsigned)fmt, surf);
     }
 }
 
@@ -481,7 +467,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (!c) {
         NSDictionary *attrs = @{
             (id)kCVPixelBufferPixelFormatTypeKey: @(fmt),
-            (id)kCVPixelBufferWidthKey: @(dw),
+            (id)kCVPixelBufferWidthKey:  @(dw),
             (id)kCVPixelBufferHeightKey: @(dh),
             (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
         };
@@ -513,7 +499,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 @interface LiteCore : NSObject
 + (instancetype)shared;
 - (BOOL)enabled;
-- (void)replaceInPlace:(CMSampleBufferRef)sb;
+- (void)replaceInPlace:(CMSampleBufferRef)sb from:(const char *)from;
 - (void)checkActionFromPlist;
 @end
 
@@ -616,7 +602,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if (needExit) { [_dec exitAction]; vlog(@"action", @"EXIT"); }
 }
 
-- (void)replaceInPlace:(CMSampleBufferRef)sb {
+- (void)replaceInPlace:(CMSampleBufferRef)sb from:(const char *)from {
     if (!sb) return;
     CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
     if (!fd || CMFormatDescriptionGetMediaType(fd) != kCMMediaType_Video) return;
@@ -624,11 +610,16 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     CVPixelBufferRef dst = CMSampleBufferGetImageBuffer(sb);
     if (!dst) return;
 
-    vl_logNewFormat(dst);
+    vl_logNewFormat(dst, from);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
-    if (!vl_supportedFormat(fmt)) return;
+
+    // 只跳过 lossy（数据错乱风险）
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
-        fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) return;
+        fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) {
+        return;
+    }
+
+    // 可写检查：只警告，不跳过
     if (!vl_writableBuffer(dst)) {
         static NSMutableSet<NSString *> *sWarn = nil;
         static NSLock *sWL = nil;
@@ -641,15 +632,32 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
         BOOL first = ![sWarn containsObject:k];
         if (first) [sWarn addObject:k];
         [sWL unlock];
-        if (first) vlog_always(@"replace", @"SKIP non-writable %zux%zu fmt=0x%x", w, h, (unsigned)fmt);
-        return;
+        if (first) vlog_always(@"replace", @"WARN non-writable %zux%zu fmt=0x%x from=%s", w, h, (unsigned)fmt, from);
+        // 继续尝试
     }
 
     uint64_t srcID = [_dec latestFrameID];
     if (srcID == 0) return;
     CVPixelBufferRef src = [_dec latestFrameRetained];
     if (!src) return;
-    [_proc transfer:src srcID:srcID into:dst];
+
+    // 替换结果诊断（每格式一次）
+    static NSMutableSet<NSString *> *sDone = nil;
+    static NSLock *sDL = nil;
+    static dispatch_once_t once2;
+    dispatch_once(&once2, ^{ sDone = [NSMutableSet new]; sDL = [NSLock new]; });
+    size_t w = CVPixelBufferGetWidth(dst);
+    size_t h = CVPixelBufferGetHeight(dst);
+    NSString *k = [NSString stringWithFormat:@"%s_%zux%zu_%u", from, w, h, (unsigned)fmt];
+    [sDL lock];
+    BOOL firstLog = ![sDone containsObject:k];
+    if (firstLog) [sDone addObject:k];
+    [sDL unlock];
+
+    BOOL ok = [_proc transfer:src srcID:srcID into:dst];
+    if (firstLog) {
+        vlog_always(@"replace", @"REPLACE[%s] %zux%zu fmt=0x%x ok=%d", from, w, h, (unsigned)fmt, ok);
+    }
     CVPixelBufferRelease(src);
 }
 
@@ -712,7 +720,10 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
                         uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
                         if (mt != 'vide') isVideo = NO;
                     }
-                    if (isVideo) [LiteCore.shared replaceInPlace:sb];
+                    if (isVideo) {
+                        NSString *cls = NSStringFromClass(object_getClass(_self));
+                        [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+                    }
                 } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
             }
         }
@@ -725,7 +736,10 @@ __attribute__((used))
 static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     @autoreleasepool {
         if (sb && [LiteCore.shared enabled]) {
-            @try { [LiteCore.shared replaceInPlace:sb]; }
+            @try {
+                NSString *cls = NSStringFromClass(object_getClass(_self));
+                [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+            }
             @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
         }
     }
@@ -769,16 +783,70 @@ static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     return hooked;
 }
 
+// ★ 通用：hook 所有实现 renderSampleBuffer:forInput: 的 BW* 类
+__attribute__((used))
+static int hook_all_render_classes(void) {
+    int hooked = 0;
+    unsigned int total = 0;
+    Class *all = objc_copyClassList(&total);
+    for (unsigned int i = 0; i < total; i++) {
+        Class c = all[i];
+        const char *name = class_getName(c);
+        if (!strstr(name, "BW")) continue;
+        if (hook_class_method(c, @selector(renderSampleBuffer:forInput:),
+                              (IMP)vl_render_body, YES)) {
+            vlog_always(@"hook", @"+render: %s", name);
+            hooked++;
+        }
+    }
+    if (all) free(all);
+    return hooked;
+}
+
 __attribute__((used))
 static void install_hooks(void) {
     if (atomic_exchange(&gInstalled, 1)) return;
+
+    // 诊断：列出所有含 emit 或 render 的 BW 类
+    {
+        unsigned int total = 0;
+        Class *all = objc_copyClassList(&total);
+        int emitCnt = 0, renderCnt = 0;
+        for (unsigned int i = 0; i < total; i++) {
+            Class c = all[i];
+            const char *name = class_getName(c);
+            if (!strstr(name, "BW")) continue;
+
+            BOOL ownsEmit = NO, ownsRender = NO;
+            unsigned int n = 0;
+            Method *list = class_copyMethodList(c, &n);
+            for (unsigned int j = 0; j < n; j++) {
+                SEL s = method_getName(list[j]);
+                const char *sn = sel_getName(s);
+                if (strcmp(sn, "emitSampleBuffer:") == 0) ownsEmit = YES;
+                if (strcmp(sn, "renderSampleBuffer:forInput:") == 0) ownsRender = YES;
+            }
+            if (list) free(list);
+
+            if (ownsEmit) { vlog_always(@"classes", @"EMIT: %s", name); emitCnt++; }
+            if (ownsRender) { vlog_always(@"classes", @"RENDER: %s", name); renderCnt++; }
+        }
+        free(all);
+        vlog_always(@"classes", @"summary: EMIT=%d RENDER=%d", emitCnt, renderCnt);
+    }
+
+    // 原有 hook
     int n1 = hook_all_subclasses("BWNodeOutput",
                 @selector(emitSampleBuffer:), (IMP)vl_emit_body);
     int n2 = hook_all_subclasses("BWStillImageScalerNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
     int n3 = hook_all_subclasses("BWPhotoEncoderNode",
                 @selector(renderSampleBuffer:forInput:), (IMP)vl_render_body);
-    vlog_always(@"hook", @"emit=%d scaler=%d encoder=%d", n1, n2, n3);
+    // 通用 render hook
+    int n4 = hook_all_render_classes();
+
+    vlog_always(@"hook", @"emit=%d scaler=%d encoder=%d generic-render=%d",
+                n1, n2, n3, n4);
 
     int token = -1;
     notify_register_dispatch(kNotifyAction, &token,
@@ -846,7 +914,6 @@ static void *install_thread(void *arg) {
 }
 
 - (void)createWindow {
-    // 找 scene：优先 foreground active
     UIWindowScene *scene = nil;
     for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
         if ([s isKindOfClass:[UIWindowScene class]] &&
@@ -860,7 +927,6 @@ static void *install_thread(void *arg) {
             if ([s isKindOfClass:[UIWindowScene class]]) { scene = (UIWindowScene *)s; break; }
         }
     }
-    // 无 scene：延迟重试，绝不用 initWithFrame:
     if (!scene) {
         static int sRetry = 0;
         sRetry++;
