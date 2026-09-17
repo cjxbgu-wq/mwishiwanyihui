@@ -10,7 +10,6 @@ VcamLite_FILES = VcamLite.m
 VcamLite_CFLAGS = \
     -fobjc-arc \
     -O2 \
-    -fvisibility=hidden \
     -Wno-deprecated-declarations \
     -Wno-unused-variable \
     -Wno-unused-function \
