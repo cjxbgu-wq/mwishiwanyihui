@@ -1,21 +1,17 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v1.3.1（生产版）
+//  VcamLite.m — 融合版相机替换内核 v1.5
 //
-//  融合来源：
-//    - vcamplus-msd: 遍历所有子类 hook + 双路径缓存
-//    - VcamMax:     三节点 hook + 自适应解码 + plist 同步 + 动作切片
-//
-//  修复历史：
+//  历史修复：
 //    P0-1   vplist_cached 用纳秒精度
 //    P0-2   decoder 用 generation counter 保证 loop 唯一
 //    P1-3   LiteCore 加 os_unfair_lock 保证多线程安全
 //    P1-4   editTime 合并写 plist
 //    v1.3-P0  LiteProcessor.transfer 的 memcpy 挪进锁内（防撕裂）
 //    v1.3-P1  LiteCore.enabled 副作用挪出锁外（防锁内 dispatch）
-//    v1.3.1   显式 #import <VideoToolbox/VideoToolbox.h>（Theos 编译必需）
+//    v1.3.1   显式 #import <VideoToolbox/VideoToolbox.h>
 //    v1.3.1   install_thread(void *arg) 加参数名（C99 兼容）
-//
-//  精简掉：卡密 / 拍照 / 反检测 / 三指手势
+//    v1.4     修复动作抢占（区分 reader 自然完成 vs 被打断）
+//    v1.5     面板改为两 Tab：控制 / 时间；动作按钮放入控制页
 //
 
 #import <Foundation/Foundation.h>
@@ -95,7 +91,6 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  plist 缓存层
-//  P0-1：st_mtimespec 纳秒精度
 // ══════════════════════════════════════════════════════════════════════
 static NSDictionary *vplist_cached(void) {
     static NSDictionary *cache = nil;
@@ -107,8 +102,7 @@ static NSDictionary *vplist_cached(void) {
     struct stat st;
     double m = 0;
     if (stat(kPlistPath.fileSystemRepresentation, &st) == 0) {
-        m = (double)st.st_mtimespec.tv_sec
-          + (double)st.st_mtimespec.tv_nsec / 1e9;
+        m = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
     }
 
     [lk lock];
@@ -151,8 +145,7 @@ static int64_t vplist_get_us(NSDictionary *pl, NSString *usKey,
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteVideoDecoder — 自适应 fps 解码 + 动作切片 + 冻结
-//  P0-2：generation counter 保证旧 loop 立即退出
+//  LiteVideoDecoder
 // ══════════════════════════════════════════════════════════════════════
 typedef NS_ENUM(int, VLState) {
     VL_STATE_LOOP = 0,
@@ -164,15 +157,10 @@ typedef NS_ENUM(int, VLState) {
 - (instancetype)initWithPath:(NSString *)path;
 - (void)start;
 - (void)stop;
-
 - (CVPixelBufferRef)latestFrameRetained CF_RETURNS_RETAINED;
 - (uint64_t)latestFrameID;
-
 - (void)seekToActionStartUs:(int64_t)startUs endUs:(int64_t)endUs;
 - (void)exitAction;
-
-@property (nonatomic, readonly) VLState state;
-@property (nonatomic, readonly) int currentAction;
 @end
 
 @implementation LiteVideoDecoder {
@@ -184,7 +172,6 @@ typedef NS_ENUM(int, VLState) {
     _Atomic int _running;
     _Atomic int _gen;
     _Atomic int _state;
-    _Atomic int _curAction;
     _Atomic int64_t _actionStartUs;
     _Atomic int64_t _actionEndUs;
     _Atomic int _actionDirty;
@@ -198,7 +185,6 @@ typedef NS_ENUM(int, VLState) {
         _frameLock = OS_UNFAIR_LOCK_INIT;
         _fps = 30.0;
         atomic_store(&_state, VL_STATE_LOOP);
-        atomic_store(&_gen, 0);
     }
     return self;
 }
@@ -210,9 +196,6 @@ typedef NS_ENUM(int, VLState) {
     if (_frame) { CVPixelBufferRelease(_frame); _frame = NULL; }
     os_unfair_lock_unlock(&_frameLock);
 }
-
-- (VLState)state { return (VLState)atomic_load(&_state); }
-- (int)currentAction { return atomic_load(&_curAction); }
 
 - (void)start {
     int myGen = (int)(atomic_fetch_add(&_gen, 1) + 1);
@@ -237,7 +220,6 @@ typedef NS_ENUM(int, VLState) {
 
 - (void)exitAction {
     atomic_store(&_state, VL_STATE_LOOP);
-    atomic_store(&_curAction, 0);
     atomic_store(&_actionDirty, 1);
 }
 
@@ -348,8 +330,12 @@ typedef NS_ENUM(int, VLState) {
             }
             [reader cancelReading];
 
+            // v1.4：区分"自然完成"和"被打断"
             int curState = atomic_load(&_state);
-            if (curState == VL_STATE_ACTION) {
+            BOOL interrupted = (curState != (int)st) ||
+                               (atomic_load(&_actionDirty) != 0);
+
+            if (!interrupted && curState == VL_STATE_ACTION) {
                 atomic_store(&_state, VL_STATE_FROZEN);
                 vlog(@"action", @"done -> frozen");
             }
@@ -361,8 +347,7 @@ typedef NS_ENUM(int, VLState) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteProcessor — 双路径像素替换
-//  v1.3-P0：memcpy 挪进锁内，防止并发重建时读到半新半旧的缓存
+//  LiteProcessor
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCache : NSObject
 @property (nonatomic, assign) CVPixelBufferRef buf;
@@ -479,7 +464,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteCore — mediaserverd 侧协调器
+//  LiteCore
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -493,10 +478,8 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     BOOL _started;
     CFAbsoluteTime _lastCheck;
     BOOL _enabledCache;
-
     int64_t _lastToken;
     BOOL _actionInited;
-
     os_unfair_lock _coreLock;
 }
 
@@ -510,8 +493,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     if ((self = [super init])) {
         _proc = [LiteProcessor new];
         _dec = [[LiteVideoDecoder alloc] initWithPath:kVideoPath];
-        _lastCheck = 0;
-        _enabledCache = NO;
         _lastToken = -1;
         _actionInited = NO;
         _coreLock = OS_UNFAIR_LOCK_INIT;
@@ -726,7 +707,6 @@ static void install_hooks(void) {
     vlog(@"hook", @"emit=%d scaler=%d encoder=%d", n1, n2, n3);
 }
 
-// v1.3.1 修复：C99 不允许匿名参数
 static void *install_thread(void *arg) {
     (void)arg;
     while (1) {
@@ -752,13 +732,18 @@ static void *install_thread(void *arg) {
 @interface VLBall : NSObject <PHPickerViewControllerDelegate>
 + (instancetype)shared;
 - (void)show;
-- (void)toggle;
 @end
 
 @implementation VLBall {
     VLWindow *_win;
     UIButton *_ball;
     UIView *_panel;
+    UIButton *_tabControlBtn;
+    UIButton *_tabTimeBtn;
+    UIView *_pageControl;
+    UIView *_pageTime;
+    UIButton *_toggleBtn;
+    int _currentTab;
 }
 
 + (instancetype)shared {
@@ -771,17 +756,6 @@ static void *install_thread(void *arg) {
     dispatch_async(dispatch_get_main_queue(), ^{
         if (self->_win) return;
         [self createWindow];
-    });
-}
-
-- (void)toggle {
-    dispatch_async(dispatch_get_main_queue(), ^{
-        if (self->_win) {
-            [self->_win removeFromSuperview];
-            self->_win = nil; self->_ball = nil; self->_panel = nil;
-        } else {
-            [self createWindow];
-        }
     });
 }
 
@@ -841,21 +815,20 @@ static void *install_thread(void *arg) {
     [g setTranslation:CGPointZero inView:_win];
 }
 
+// ══════════════════════════════════════════════════════════════════════
+//  两 Tab 面板：控制 / 时间
+// ══════════════════════════════════════════════════════════════════════
 - (void)showPanel {
     CGFloat w = 240;
     CGFloat pad = 10;
-    CGFloat rowH = 38;
-    CGFloat gap = 6;
-    CGFloat h = pad + rowH + gap
-              + rowH + gap
-              + 16 + gap
-              + rowH + gap
-              + rowH + gap
-              + rowH + gap
-              + rowH + gap
-              + 16 + gap
-              + 3 * (rowH + gap)
-              + pad;
+    CGFloat tabH = 36;
+    CGFloat tabGap = 6;
+    CGFloat rowH = 40;
+    CGFloat rowGap = 6;
+
+    // 控制页 6 行（选择视频 / 禁用 / 眨 / 嘴 / 头 / 退出动作）
+    CGFloat contentH = 6 * rowH + 5 * rowGap;
+    CGFloat h = pad + tabH + tabGap + contentH + pad;
 
     CGFloat px = _ball.frame.origin.x - w - 8;
     if (px < 5) px = CGRectGetMaxX(_ball.frame) + 8;
@@ -869,66 +842,69 @@ static void *install_thread(void *arg) {
     _panel.layer.cornerRadius = 12;
     _panel.layer.masksToBounds = YES;
 
-    CGFloat y = pad;
+    // ── Tab 行（2 个等宽）──
+    CGFloat tabW = (w - 2 * pad - tabGap) / 2.0;
+    _tabControlBtn = [self makeTab:@"控制" x:pad y:pad w:tabW h:tabH tag:0];
+    _tabTimeBtn    = [self makeTab:@"时间" x:pad + tabW + tabGap y:pad w:tabW h:tabH tag:1];
+    [_panel addSubview:_tabControlBtn];
+    [_panel addSubview:_tabTimeBtn];
 
-    UIButton *pick = [self makeBtn:@"选择视频" y:y];
-    [pick addTarget:self action:@selector(pickVideo) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:pick]; y += rowH + gap;
+    // ── 内容区（两页重叠）──
+    CGFloat contentY = pad + tabH + tabGap;
+    CGFloat contentW = w - 2 * pad;
+    CGRect contentFrame = CGRectMake(pad, contentY, contentW, contentH);
 
-    BOOL en = vplist_enabled();
-    UIButton *tog = [self makeBtn:(en ? @"禁用相机" : @"启用相机") y:y];
-    [tog addTarget:self action:@selector(toggleEnabled:) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:tog]; y += rowH + gap;
+    _pageControl = [self makePageWithFrame:contentFrame];
+    _pageTime    = [self makePageWithFrame:contentFrame];
 
-    UILabel *l1 = [self makeLabel:@"动作" y:y];
-    [_panel addSubview:l1]; y += 16 + gap;
+    [self fillControlPage];
+    [self fillTimePage];
 
-    UIButton *bk = [self makeBtn:@"眨" y:y];
-    [bk addTarget:self action:@selector(actionBlink) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:bk]; y += rowH + gap;
+    [_panel addSubview:_pageControl];
+    [_panel addSubview:_pageTime];
 
-    UIButton *mh = [self makeBtn:@"嘴" y:y];
-    [mh addTarget:self action:@selector(actionMouth) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:mh]; y += rowH + gap;
-
-    UIButton *hd = [self makeBtn:@"头" y:y];
-    [hd addTarget:self action:@selector(actionHead) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:hd]; y += rowH + gap;
-
-    UIButton *ex = [self makeBtn:@"退出动作" y:y];
-    ex.backgroundColor = [UIColor colorWithRed:0.55 green:0.30 blue:0.30 alpha:1];
-    [ex addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:ex]; y += rowH + gap;
-
-    UILabel *l2 = [self makeLabel:@"时间设置" y:y];
-    [_panel addSubview:l2]; y += 16 + gap;
-
-    UIButton *t1 = [self makeBtn:@"眨时间" y:y];
-    [t1 addTarget:self action:@selector(timeBlink) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:t1]; y += rowH + gap;
-
-    UIButton *t2 = [self makeBtn:@"嘴时间" y:y];
-    [t2 addTarget:self action:@selector(timeMouth) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:t2]; y += rowH + gap;
-
-    UIButton *t3 = [self makeBtn:@"头时间" y:y];
-    [t3 addTarget:self action:@selector(timeHead) forControlEvents:UIControlEventTouchUpInside];
-    [_panel addSubview:t3];
-
+    [self switchToTab:_currentTab];
     [_win addSubview:_panel];
 }
 
-- (UILabel *)makeLabel:(NSString *)t y:(CGFloat)y {
-    UILabel *l = [[UILabel alloc] initWithFrame:CGRectMake(12, y, 216, 14)];
-    l.text = t;
-    l.textColor = [UIColor colorWithWhite:0.75 alpha:1];
-    l.font = [UIFont systemFontOfSize:11];
-    return l;
+- (UIView *)makePageWithFrame:(CGRect)frame {
+    UIView *p = [[UIView alloc] initWithFrame:frame];
+    p.backgroundColor = [UIColor clearColor];
+    p.hidden = YES;
+    return p;
 }
 
-- (UIButton *)makeBtn:(NSString *)t y:(CGFloat)y {
+- (UIButton *)makeTab:(NSString *)t x:(CGFloat)x y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h tag:(int)tag {
     UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
-    b.frame = CGRectMake(10, y, 220, 38);
+    b.frame = CGRectMake(x, y, w, h);
+    [b setTitle:t forState:UIControlStateNormal];
+    [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    b.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    b.backgroundColor = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1];
+    b.layer.cornerRadius = 7;
+    b.tag = tag;
+    [b addTarget:self action:@selector(tabTapped:) forControlEvents:UIControlEventTouchUpInside];
+    return b;
+}
+
+- (void)tabTapped:(UIButton *)sender {
+    _currentTab = (int)sender.tag;
+    [self switchToTab:_currentTab];
+}
+
+- (void)switchToTab:(int)tab {
+    _pageControl.hidden = (tab != 0);
+    _pageTime.hidden    = (tab != 1);
+
+    UIColor *inactive = [UIColor colorWithRed:0.32 green:0.33 blue:0.35 alpha:1];
+    UIColor *active   = [UIColor colorWithRed:0.58 green:0.59 blue:0.61 alpha:1];
+    _tabControlBtn.backgroundColor = (tab == 0) ? active : inactive;
+    _tabTimeBtn.backgroundColor    = (tab == 1) ? active : inactive;
+}
+
+- (UIButton *)makeBtn:(NSString *)t y:(CGFloat)y w:(CGFloat)w h:(CGFloat)h {
+    UIButton *b = [UIButton buttonWithType:UIButtonTypeSystem];
+    b.frame = CGRectMake(0, y, w, h);
     [b setTitle:t forState:UIControlStateNormal];
     [b setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
     b.titleLabel.font = [UIFont boldSystemFontOfSize:15];
@@ -937,9 +913,68 @@ static void *install_thread(void *arg) {
     return b;
 }
 
+// ── 控制页：选择视频 / 禁用相机 / 眨 / 嘴 / 头 / 退出动作 ──
+- (void)fillControlPage {
+    CGFloat w = _pageControl.bounds.size.width;
+    CGFloat rowH = 40;
+    CGFloat gap = 6;
+    CGFloat y = 0;
+
+    UIButton *pick = [self makeBtn:@"选择视频" y:y w:w h:rowH];
+    [pick addTarget:self action:@selector(pickVideo) forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:pick];
+    y += rowH + gap;
+
+    BOOL en = vplist_enabled();
+    _toggleBtn = [self makeBtn:(en ? @"禁用相机" : @"启用相机") y:y w:w h:rowH];
+    [_toggleBtn addTarget:self action:@selector(toggleEnabled:)
+         forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:_toggleBtn];
+    y += rowH + gap;
+
+    UIButton *bk = [self makeBtn:@"眨" y:y w:w h:rowH];
+    [bk addTarget:self action:@selector(actionBlink) forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:bk];
+    y += rowH + gap;
+
+    UIButton *mh = [self makeBtn:@"嘴" y:y w:w h:rowH];
+    [mh addTarget:self action:@selector(actionMouth) forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:mh];
+    y += rowH + gap;
+
+    UIButton *hd = [self makeBtn:@"头" y:y w:w h:rowH];
+    [hd addTarget:self action:@selector(actionHead) forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:hd];
+    y += rowH + gap;
+
+    UIButton *ex = [self makeBtn:@"退出动作" y:y w:w h:rowH];
+    ex.backgroundColor = [UIColor colorWithRed:0.55 green:0.30 blue:0.30 alpha:1];
+    [ex addTarget:self action:@selector(actionExit) forControlEvents:UIControlEventTouchUpInside];
+    [_pageControl addSubview:ex];
+}
+
+// ── 时间页：眨时间 / 嘴时间 / 头时间 ──
+- (void)fillTimePage {
+    CGFloat w = _pageTime.bounds.size.width;
+    CGFloat rowH = 40;
+    CGFloat gap = 6;
+    CGFloat y = 0;
+
+    NSString *titles[3] = {@"眨时间", @"嘴时间", @"头时间"};
+    SEL sels[3] = {@selector(timeBlink), @selector(timeMouth), @selector(timeHead)};
+    for (int i = 0; i < 3; i++) {
+        UIButton *b = [self makeBtn:titles[i] y:y w:w h:rowH];
+        [b addTarget:self action:sels[i] forControlEvents:UIControlEventTouchUpInside];
+        [_pageTime addSubview:b];
+        y += rowH + gap;
+    }
+}
+
 - (void)dismissPanel {
     [_panel removeFromSuperview];
     _panel = nil;
+    _pageControl = nil;
+    _pageTime = nil;
 }
 
 - (void)toggleEnabled:(UIButton *)b {
