@@ -1,6 +1,7 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.2
-//  修复：私有 Lossy 格式（&xv0 / &8v0 / -xv0 等）无法创建 cache buffer 导致录像不替换
+//  VcamLite.m — 融合版相机替换内核 v2.3
+//  v2.2：私有 Lossy 格式（&xv0 / &8v0 等）直转
+//  v2.3：修复视频模式闪烁/黑屏（render 去重 + VT session 锁 + 私有格式 srcID 缓存）
 //
 
 #import <Foundation/Foundation.h>
@@ -434,7 +435,7 @@ typedef NS_ENUM(int, VLState) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteProcessor（★ 本次修改）
+//  LiteProcessor（★ v2.3: 加 VT 锁 + 私有格式 srcID 缓存）
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCache : NSObject
 @property (nonatomic, assign) CVPixelBufferRef buf;
@@ -442,6 +443,15 @@ typedef NS_ENUM(int, VLState) {
 @end
 @implementation LiteCache
 - (void)dealloc { if (_buf) CVPixelBufferRelease(_buf); }
+@end
+
+// ★ v2.3: 私有格式的 srcID 缓存条目
+@interface LitePrivateCache : NSObject
+@property (nonatomic, assign) uint32_t iosurfaceID;
+@property (nonatomic, assign) uint64_t srcID;
+@property (nonatomic, assign) CFAbsoluteTime lastUse;
+@end
+@implementation LitePrivateCache
 @end
 
 @interface LiteProcessor : NSObject
@@ -453,12 +463,20 @@ typedef NS_ENUM(int, VLState) {
     VTPixelTransferSessionRef _slowSess;   // 非 RealTime（私有/lossy 格式直转）
     NSRecursiveLock *_lock;
     NSMutableDictionary<NSString *, LiteCache *> *_caches;
+
+    // ★ v2.3 F2: VT session 专用锁
+    NSLock *_vtLock;
+
+    // ★ v2.3 F3: 私有格式 srcID 缓存，key = IOSurface ID
+    NSMutableDictionary<NSNumber *, LitePrivateCache *> *_privateCache;
 }
 
 - (instancetype)init {
     if ((self = [super init])) {
         _lock = [NSRecursiveLock new];
         _caches = [NSMutableDictionary new];
+        _vtLock = [NSLock new];
+        _privateCache = [NSMutableDictionary new];
 
         // RealTime session（标准格式）
         OSStatus s = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_sess);
@@ -522,12 +540,10 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
 // 判断是否为私有/lossy 格式（不能用 CVPixelBufferCreate 创建）
 static BOOL vl_is_private_format(OSType fmt) {
-    // 标准格式 → NO
     if (fmt == kCVPixelFormatType_32BGRA) return NO;
     if (fmt == 0x34323076) return NO;  // '420v'
     if (fmt == 0x34323066) return NO;  // '420f'
     if (fmt == 0x70343230) return NO;  // 'p420'
-    // 其他全部当私有处理
     return YES;
 }
 
@@ -537,16 +553,54 @@ static BOOL vl_is_private_format(OSType fmt) {
     size_t dh = CVPixelBufferGetHeight(dst);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
-    // ★★★ 私有/lossy 格式：直转，不创建中间 cache ★★★
+    // ═════════════════════════════════════════════════════════════
+    // 私有/lossy 格式：直转
+    //   ★ F3: 同一 dst IOSurface + 同一 srcID 只转一次
+    //   ★ F2: VT session 加锁
+    // ═════════════════════════════════════════════════════════════
     if (vl_is_private_format(fmt)) {
-        OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, dst);
+        IOSurfaceRef surf = CVPixelBufferGetIOSurface(dst);
+        uint32_t surfID = surf ? IOSurfaceGetID(surf) : 0;
+        NSNumber *cacheKey = @(surfID);
 
-        // RealTime 失败，尝试用非 RealTime session
+        // ★ F3: 检查是否已用同一 srcID 替换过
+        [_lock lock];
+        LitePrivateCache *pc = _privateCache[cacheKey];
+        if (pc && pc.srcID == srcID && srcID != 0) {
+            [_lock unlock];
+            return YES;
+        }
+        if (!pc) {
+            pc = [LitePrivateCache new];
+            pc.iosurfaceID = surfID;
+            _privateCache[cacheKey] = pc;
+        }
+        [_lock unlock];
+
+        // ★ F2: 锁住 VT session
+        [_vtLock lock];
+        OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, dst);
         if (s != noErr && _slowSess) {
             s = VTPixelTransferSessionTransferImage(_slowSess, src, dst);
         }
+        [_vtLock unlock];
 
-        // 诊断（每种格式只打一次）
+        if (s == noErr) {
+            [_lock lock];
+            pc.srcID = srcID;
+            pc.lastUse = CFAbsoluteTimeGetCurrent();
+            if (_privateCache.count > 64) {
+                CFAbsoluteTime cutoff = CFAbsoluteTimeGetCurrent() - 10.0;
+                NSMutableArray *toRemove = [NSMutableArray array];
+                for (NSNumber *k in _privateCache) {
+                    if (_privateCache[k].lastUse < cutoff) [toRemove addObject:k];
+                }
+                [_privateCache removeObjectsForKeys:toRemove];
+            }
+            [_lock unlock];
+        }
+
+        // 诊断
         static NSMutableSet<NSNumber *> *sSeen = nil;
         static NSLock *sSeenLock = nil;
         static dispatch_once_t once;
@@ -554,10 +608,10 @@ static BOOL vl_is_private_format(OSType fmt) {
             sSeen = [NSMutableSet new];
             sSeenLock = [NSLock new];
         });
-        NSNumber *k = @(fmt);
+        NSNumber *dk = @(fmt);
         [sSeenLock lock];
-        BOOL first = ![sSeen containsObject:k];
-        if (first) [sSeen addObject:k];
+        BOOL first = ![sSeen containsObject:dk];
+        if (first) [sSeen addObject:dk];
         [sSeenLock unlock];
         if (first) {
             char fcc[5] = {0};
@@ -571,7 +625,9 @@ static BOOL vl_is_private_format(OSType fmt) {
         return s == noErr;
     }
 
-    // ---- 标准格式：走原有 cache 快路径 ----
+    // ═════════════════════════════════════════════════════════════
+    // 标准格式：走原有 cache 快路径
+    // ═════════════════════════════════════════════════════════════
     NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dw, dh, (unsigned)fmt];
 
     [_lock lock];
@@ -594,7 +650,10 @@ static BOOL vl_is_private_format(OSType fmt) {
         _caches[key] = c;
     }
     if (c.srcID != srcID) {
+        // ★ F2: VT session 加锁
+        [_vtLock lock];
         OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, c.buf);
+        [_vtLock unlock];
         if (s == noErr) c.srcID = srcID;
         else { c.srcID = 0; [_lock unlock]; return NO; }
     }
@@ -606,7 +665,7 @@ static BOOL vl_is_private_format(OSType fmt) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteCore（★ 本次修改 replaceInPlace）
+//  LiteCore
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -726,7 +785,6 @@ static BOOL vl_is_private_format(OSType fmt) {
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
     // ★ 修复：不再跳过 lossy，改为记录并继续
-    // 覆盖：-xv0 / -8v0 / -xf0 / -8f0 / -420 / &xv0 / &8v0 / &xf0 / &8f0
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
         fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230 ||
         fmt == 0x26787630 || fmt == 0x26387630 ||
@@ -876,11 +934,20 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
 
     @autoreleasepool {
         if (sb && [LiteCore.shared enabled]) {
-            @try {
-                NSString *cls = NSStringFromClass(object_getClass(_self));
-                [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+            // ★ v2.3 F1: 与 vl_emit_body 对称的去重
+            CFTypeRef processed = CMGetAttachment(sb, kVLProcessedKey, NULL);
+            BOOL alreadyProcessed = (processed != NULL &&
+                                     CFGetTypeID(processed) == CFBooleanGetTypeID() &&
+                                     CFBooleanGetValue((CFBooleanRef)processed));
+            if (!alreadyProcessed) {
+                CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
+                                kCMAttachmentMode_ShouldNotPropagate);
+                @try {
+                    NSString *cls = NSStringFromClass(object_getClass(_self));
+                    [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+                }
+                @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
             }
-            @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
         }
     }
     IMP orig = orig_imp_for_instance(_self);
@@ -1429,7 +1496,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.2", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1440,7 +1507,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.2", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
