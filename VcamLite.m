@@ -1,8 +1,7 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.1
-//  【回滚 v2.0 激进改动】+【只读诊断】
+//  VcamLite.m — 融合版相机替换内核 v2.1-log
 //  行为 = v1.9（照片/人像/全景正常，录像类暂未替换）
-//  新增：emit/render 调用跟踪 + BW 方法清单 dump（只打印，不改行为）
+//  新增：C 层文件日志（Filza 可看）+ emit/render 跟踪 + BW 方法清单 dump
 //
 
 #import <Foundation/Foundation.h>
@@ -23,6 +22,11 @@
 #import <pthread.h>
 #import <math.h>
 #import <notify.h>
+#include <stdio.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <time.h>
 
 // ══════════════════════════════════════════════════════════════════════
 //  常量
@@ -58,6 +62,52 @@ static const int64_t kHeadEndDefUs    = 5500000LL;
 static CFStringRef const kVLProcessedKey = CFSTR("com.vlite.processed");
 
 // ══════════════════════════════════════════════════════════════════════
+//  ★ Filza 日志：C 层直接 fopen/fprintf（不依赖 NSLog / NSFileHandle）
+// ══════════════════════════════════════════════════════════════════════
+static FILE *g_vl_log_fp = NULL;
+static pthread_mutex_t g_vl_log_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+static void vl_write_log_file(const char *tag, const char *msg) {
+    if (!msg) return;
+    pthread_mutex_lock(&g_vl_log_mutex);
+
+    if (!g_vl_log_fp) {
+        const char *paths[] = {
+            "/var/mobile/Media/DCIM/vlite_debug.log",
+            "/var/mobile/Library/Preferences/vlite_debug.log",
+            "/var/mobile/vlite_debug.log",
+            "/tmp/vlite_debug.log",
+            "/var/tmp/vlite_debug.log",
+            NULL
+        };
+        for (int i = 0; paths[i]; i++) {
+            g_vl_log_fp = fopen(paths[i], "a");
+            if (g_vl_log_fp) {
+                fprintf(g_vl_log_fp,
+                        "===== vlite log opened at %s (pid=%d) =====\n",
+                        paths[i], (int)getpid());
+                fflush(g_vl_log_fp);
+                break;
+            }
+        }
+    }
+
+    if (g_vl_log_fp) {
+        struct timeval tv;
+        gettimeofday(&tv, NULL);
+        struct tm tmv;
+        time_t sec = tv.tv_sec;
+        localtime_r(&sec, &tmv);
+        fprintf(g_vl_log_fp, "[%02d:%02d:%02d.%03d][%s] %s\n",
+                tmv.tm_hour, tmv.tm_min, tmv.tm_sec,
+                (int)(tv.tv_usec / 1000), tag ? tag : "?", msg);
+        fflush(g_vl_log_fp);
+    }
+
+    pthread_mutex_unlock(&g_vl_log_mutex);
+}
+
+// ══════════════════════════════════════════════════════════════════════
 //  日志
 // ══════════════════════════════════════════════════════════════════════
 __attribute__((used))
@@ -66,6 +116,7 @@ static void vlog_always(NSString *tag, NSString *fmt, ...) {
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[vlite][%@] %@", tag, m);
+    vl_write_log_file([tag UTF8String], [m UTF8String]);
 }
 
 static void vlog(NSString *tag, NSString *fmt, ...) {
@@ -90,6 +141,7 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
     NSString *m = [[NSString alloc] initWithFormat:fmt arguments:ap];
     va_end(ap);
     NSLog(@"[vlite][%@] %@", tag, m);
+    vl_write_log_file([tag UTF8String], [m UTF8String]);
 }
 
 // ══════════════════════════════════════════════════════════════════════
@@ -616,7 +668,6 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     vl_logNewFormat(dst, from);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
-    // Lossy 格式：v1.9 起改为只诊断不跳过
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
         fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) {
         static NSMutableSet<NSString *> *sSeenLossy = nil;
@@ -710,18 +761,15 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
-// ★ v1.9 原有 emit hook（行为不变）
 __attribute__((used))
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
-    // ★ v2.1 新增：只读诊断（不改行为）
     static _Atomic int sCnt = 0;
     int c = atomic_fetch_add(&sCnt, 1);
     if ((c % 120) == 0) {
         CVPixelBufferRef pb = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
         OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
         const char *cls = object_getClassName(_self);
-        __attribute__((unused)) uint64_t fid = LiteCore.shared.enabled ? 1 : 0;
-        NSLog(@"[vlite][emit-trace] #%d cls=%s fmt=0x%x", c, cls, (unsigned)fmt);
+        vlog_always(@"emit-trace", @"#%d cls=%s fmt=0x%x", c, cls, (unsigned)fmt);
     }
 
     @autoreleasepool {
@@ -753,17 +801,15 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
 }
 
-// ★ v1.9 原有 render hook（行为不变）
 __attribute__((used))
 static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
-    // ★ v2.1 新增：只读诊断
     static _Atomic int sCnt2 = 0;
     int c = atomic_fetch_add(&sCnt2, 1);
     if ((c % 120) == 0) {
         CVPixelBufferRef pb = sb ? CMSampleBufferGetImageBuffer(sb) : NULL;
         OSType fmt = pb ? CVPixelBufferGetPixelFormatType(pb) : 0;
         const char *cls = object_getClassName(_self);
-        NSLog(@"[vlite][render-trace] #%d cls=%s fmt=0x%x", c, cls, (unsigned)fmt);
+        vlog_always(@"render-trace", @"#%d cls=%s fmt=0x%x", c, cls, (unsigned)fmt);
     }
 
     @autoreleasepool {
@@ -779,7 +825,6 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, input);
 }
 
-// ★ v1.9 原有 hook_class_method（行为不变）
 __attribute__((used))
 static BOOL hook_class_method(Class cls, SEL sel, IMP newImp, BOOL requireOwns) {
     Method m = class_getInstanceMethod(cls, sel);
@@ -806,7 +851,6 @@ static BOOL hook_class_method(Class cls, SEL sel, IMP newImp, BOOL requireOwns) 
     return YES;
 }
 
-// ★ v1.9 原有 hook_all_subclasses（行为不变）
 __attribute__((used))
 static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     Class base = objc_getClass(baseName);
@@ -828,7 +872,6 @@ static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     return hooked;
 }
 
-// ★ v1.9 原有 hook_all_render_classes（行为不变）
 __attribute__((used))
 static int hook_all_render_classes(void) {
     int hooked = 0;
@@ -854,13 +897,12 @@ static int hook_all_render_classes(void) {
     return hooked;
 }
 
-// ★ v2.1 新增：一次性 dump 所有 BW* 类中含关键词的方法（只打印，不改变任何行为）
 __attribute__((used))
 static void vl_dump_bw_methods_once(void) {
     static BOOL sDone = NO;
     if (sDone) return;
     sDone = YES;
-    NSLog(@"[vlite][dump] ===== BW methods dump start =====");
+    vlog_always(@"dump", @"===== BW methods dump start =====");
     unsigned int total = 0;
     Class *all = objc_copyClassList(&total);
     for (unsigned int i = 0; i < total; i++) {
@@ -878,16 +920,15 @@ static void vl_dump_bw_methods_once(void) {
                 strstr(sn, "rocess") || strstr(sn, "eceive") ||
                 strstr(sn, "apture") || strstr(sn, "ample")) {
                 const char *enc = method_getTypeEncoding(list[j]);
-                NSLog(@"[vlite][dump] %s -> %s | %s", name, sn, enc ? enc : "?");
+                vlog_always(@"dump", @"%s -> %s | %s", name, sn, enc ? enc : "?");
             }
         }
         if (list) free(list);
     }
     free(all);
-    NSLog(@"[vlite][dump] ===== BW methods dump end =====");
+    vlog_always(@"dump", @"===== BW methods dump end =====");
 }
 
-// ★ v1.9 原有 install_hooks（只加一行 dump 调用）
 __attribute__((used))
 static void install_hooks(void) {
     int n1 = hook_all_subclasses("BWNodeOutput",
@@ -903,10 +944,8 @@ static void install_hooks(void) {
                     n1, n2, n3, n4);
     }
 
-    // ★ v2.1 新增：只跑一次的诊断
     vl_dump_bw_methods_once();
 
-    // notify 只注册一次
     if (atomic_exchange(&gInstalled, 1) == 0) {
         int token = -1;
         notify_register_dispatch(kNotifyAction, &token,
@@ -922,7 +961,6 @@ static void install_hooks(void) {
     }
 }
 
-// ★ v1.9 原有 install_thread（行为不变）
 __attribute__((used))
 static void *install_thread(void *arg) {
     (void)arg;
@@ -938,7 +976,7 @@ static void *install_thread(void *arg) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  UI 层（完全保持原样）
+//  UI 层
 // ══════════════════════════════════════════════════════════════════════
 @interface VLWindow : UIWindow @end
 @implementation VLWindow
@@ -1329,7 +1367,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd");
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.1-log", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1340,7 +1378,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard");
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.1-log", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
