@@ -1,7 +1,6 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.1-log
-//  行为 = v1.9（照片/人像/全景正常，录像类暂未替换）
-//  新增：C 层文件日志（Filza 可看）+ emit/render 跟踪 + BW 方法清单 dump
+//  VcamLite.m — 融合版相机替换内核 v2.2
+//  修复：私有 Lossy 格式（&xv0 / &8v0 / -xv0 等）无法创建 cache buffer 导致录像不替换
 //
 
 #import <Foundation/Foundation.h>
@@ -62,7 +61,7 @@ static const int64_t kHeadEndDefUs    = 5500000LL;
 static CFStringRef const kVLProcessedKey = CFSTR("com.vlite.processed");
 
 // ══════════════════════════════════════════════════════════════════════
-//  ★ Filza 日志：C 层直接 fopen/fprintf（不依赖 NSLog / NSFileHandle）
+//  Filza 日志：C 层直接 fopen/fprintf
 // ══════════════════════════════════════════════════════════════════════
 static FILE *g_vl_log_fp = NULL;
 static pthread_mutex_t g_vl_log_mutex = PTHREAD_MUTEX_INITIALIZER;
@@ -435,7 +434,7 @@ typedef NS_ENUM(int, VLState) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteProcessor
+//  LiteProcessor（★ 本次修改）
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCache : NSObject
 @property (nonatomic, assign) CVPixelBufferRef buf;
@@ -450,7 +449,8 @@ typedef NS_ENUM(int, VLState) {
 @end
 
 @implementation LiteProcessor {
-    VTPixelTransferSessionRef _sess;
+    VTPixelTransferSessionRef _sess;       // RealTime（标准格式快路径）
+    VTPixelTransferSessionRef _slowSess;   // 非 RealTime（私有/lossy 格式直转）
     NSRecursiveLock *_lock;
     NSMutableDictionary<NSString *, LiteCache *> *_caches;
 }
@@ -459,18 +459,28 @@ typedef NS_ENUM(int, VLState) {
     if ((self = [super init])) {
         _lock = [NSRecursiveLock new];
         _caches = [NSMutableDictionary new];
+
+        // RealTime session（标准格式）
         OSStatus s = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_sess);
         if (s != noErr || !_sess) { _sess = NULL; return self; }
         CFStringRef *pRT = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_RealTime");
         CFStringRef *pSM = (CFStringRef *)dlsym(RTLD_DEFAULT, "kVTPixelTransferPropertyKey_ScalingMode");
         if (pRT && *pRT) VTSessionSetProperty(_sess, *pRT, kCFBooleanTrue);
         if (pSM && *pSM) VTSessionSetProperty(_sess, *pSM, CFSTR("Trim"));
+
+        // 慢速 session（私有/lossy 格式直转）——不设 RealTime
+        OSStatus s2 = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_slowSess);
+        if (s2 != noErr || !_slowSess) { _slowSess = NULL; }
+        else {
+            if (pSM && *pSM) VTSessionSetProperty(_slowSess, *pSM, CFSTR("Trim"));
+        }
     }
     return self;
 }
 
 - (void)dealloc {
     if (_sess) { VTPixelTransferSessionInvalidate(_sess); CFRelease(_sess); }
+    if (_slowSess) { VTPixelTransferSessionInvalidate(_slowSess); CFRelease(_slowSess); }
 }
 
 static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
@@ -510,11 +520,58 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     return ok;
 }
 
+// 判断是否为私有/lossy 格式（不能用 CVPixelBufferCreate 创建）
+static BOOL vl_is_private_format(OSType fmt) {
+    // 标准格式 → NO
+    if (fmt == kCVPixelFormatType_32BGRA) return NO;
+    if (fmt == 0x34323076) return NO;  // '420v'
+    if (fmt == 0x34323066) return NO;  // '420f'
+    if (fmt == 0x70343230) return NO;  // 'p420'
+    // 其他全部当私有处理
+    return YES;
+}
+
 - (BOOL)transfer:(CVPixelBufferRef)src srcID:(uint64_t)srcID into:(CVPixelBufferRef)dst {
     if (!src || !dst || !_sess) return NO;
     size_t dw = CVPixelBufferGetWidth(dst);
     size_t dh = CVPixelBufferGetHeight(dst);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
+
+    // ★★★ 私有/lossy 格式：直转，不创建中间 cache ★★★
+    if (vl_is_private_format(fmt)) {
+        OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, dst);
+
+        // RealTime 失败，尝试用非 RealTime session
+        if (s != noErr && _slowSess) {
+            s = VTPixelTransferSessionTransferImage(_slowSess, src, dst);
+        }
+
+        // 诊断（每种格式只打一次）
+        static NSMutableSet<NSNumber *> *sSeen = nil;
+        static NSLock *sSeenLock = nil;
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            sSeen = [NSMutableSet new];
+            sSeenLock = [NSLock new];
+        });
+        NSNumber *k = @(fmt);
+        [sSeenLock lock];
+        BOOL first = ![sSeen containsObject:k];
+        if (first) [sSeen addObject:k];
+        [sSeenLock unlock];
+        if (first) {
+            char fcc[5] = {0};
+            fcc[0] = (fmt >> 24) & 0xff;
+            fcc[1] = (fmt >> 16) & 0xff;
+            fcc[2] = (fmt >> 8) & 0xff;
+            fcc[3] = fmt & 0xff;
+            vlog_always(@"proc", @"DIRECT-VT fmt='%s'(0x%x) %zux%zu status=%d",
+                        fcc, (unsigned)fmt, dw, dh, (int)s);
+        }
+        return s == noErr;
+    }
+
+    // ---- 标准格式：走原有 cache 快路径 ----
     NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dw, dh, (unsigned)fmt];
 
     [_lock lock];
@@ -549,7 +606,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  LiteCore
+//  LiteCore（★ 本次修改 replaceInPlace）
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -668,8 +725,12 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
     vl_logNewFormat(dst, from);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
+    // ★ 修复：不再跳过 lossy，改为记录并继续
+    // 覆盖：-xv0 / -8v0 / -xf0 / -8f0 / -420 / &xv0 / &8v0 / &xf0 / &8f0
     if (fmt == 0x2D387630 || fmt == 0x2D386630 ||
-        fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230) {
+        fmt == 0x2D787630 || fmt == 0x2D786630 || fmt == 0x2D343230 ||
+        fmt == 0x26787630 || fmt == 0x26387630 ||
+        fmt == 0x26786630 || fmt == 0x26386630) {
         static NSMutableSet<NSString *> *sSeenLossy = nil;
         static NSLock *sLL = nil;
         static dispatch_once_t once;
@@ -680,6 +741,7 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
         if (first) [sSeenLossy addObject:k];
         [sLL unlock];
         if (first) vlog_always(@"replace", @"HIT lossy 0x%x from=%s (will attempt)", (unsigned)fmt, from);
+        // 不 return，继续尝试替换
     }
 
     if (!vl_writableBuffer(dst)) {
@@ -1367,7 +1429,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.1-log", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.2", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1378,7 +1440,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.1-log", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.2", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
