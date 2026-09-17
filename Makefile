@@ -18,6 +18,6 @@ VcamLite_CFLAGS = \
 
 VcamLite_FRAMEWORKS = \
     UIKit Foundation AVFoundation CoreMedia CoreVideo \
-    CoreImage CoreGraphics ImageIO PhotosUI
+    VideoToolbox CoreImage CoreGraphics ImageIO PhotosUI
 
 include $(THEOS_MAKE_PATH)/tweak.mk
