@@ -1,12 +1,11 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.3.1
+//  VcamLite.m — 融合版相机替换内核 v2.3.2
 //  v2.3：私有 Lossy 格式（&xv0 / &8v0 等）直转 + render 去重 + VT session 锁 + 私有格式 srcID 缓存
-//  v2.3.1（基于 v2.3，仅修三个问题）：
-//        FIX-P  vplist_update 读失败不再写空字典覆盖（修"动作替换失败/还原真相机"）
-//        FIX-Q  vplist_cached 读失败保留旧 cache
-//        FIX-R  方向支持：LiteVideoDecoder 读 preferredTransform + LiteProcessor 加 VTPixelRotationSession
-//               + UI 加"旋转"按钮 + plist manualRotation 字段
-//        FIX-S  悬浮球拖动时关面板 + 面板空白区穿透
+//  v2.3.1：FIX-P/Q/R/S
+//  v2.3.2（仅针对"动作按键后还原真实相机"）：
+//        FIX-T  vplist_enabled 加 lastKnown 缓存，读不到时保持上次已知值
+//               对齐 VcamMax 的 lastEnabledState 思路
+//        FIX-U  LiteCore.enabled 加连续 NO 防抖（1.5 秒窗口）
 //
 
 #import <Foundation/Foundation.h>
@@ -43,7 +42,7 @@ static const char *const kNotifyAction = "com.vlite.action.changed";
 static NSString *const kEnableKey     = @"enabled";
 static NSString *const kActionToken   = @"actionToken";
 static NSString *const kActionActive  = @"actionActive";
-static NSString *const kManualRotKey  = @"manualRotation";   // ★ FIX-R
+static NSString *const kManualRotKey  = @"manualRotation";
 
 static NSString *const kBlinkS_us = @"actionBlinkStartUs";
 static NSString *const kBlinkE_us = @"actionBlinkEndUs";
@@ -135,8 +134,8 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  plist
-//  ★ FIX-P: vplist_update 读失败时 abort（不写空字典）
-//  ★ FIX-Q: vplist_cached 读失败时保留旧 cache
+//  FIX-P: vplist_update 读失败时 abort，不写空字典
+//  FIX-Q: vplist_cached 读失败保留旧 cache
 // ══════════════════════════════════════════════════════════════════════
 __attribute__((used))
 static NSDictionary *vplist_cached(void) {
@@ -159,10 +158,9 @@ static NSDictionary *vplist_cached(void) {
             lastMtime = m;
             cache = newCache;
         } else if (!cache) {
-            // 首次读失败：记录 mtime 但不覆盖 nil cache
             lastMtime = m;
         }
-        // ★ FIX-Q: 已有 cache 但本次读失败：保留旧 cache，不更新 lastMtime 以便下次重试
+        // 已有 cache 但读失败：保留旧 cache，不更新 lastMtime
     }
     NSDictionary *r = cache;
     [lk unlock];
@@ -174,12 +172,10 @@ static void vplist_update(void (^block)(NSMutableDictionary *)) {
     @synchronized(@"vlite.plist") {
         NSDictionary *existing = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
         if (!existing) {
-            // ★ FIX-P: 重试一次（可能是 atomic 写的瞬时窗口）
             [NSThread sleepForTimeInterval:0.03];
             existing = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
         }
         if (!existing) {
-            // ★ FIX-P: 彻底读失败 → abort，绝不写空字典覆盖
             vlog_always(@"plist", @"update read failed, ABORT to protect fields");
             return;
         }
@@ -190,11 +186,44 @@ static void vplist_update(void (^block)(NSMutableDictionary *)) {
     notify_post(kNotifyAction);
 }
 
+// ★ FIX-T: vplist_enabled 加 lastKnown 缓存
+//   对齐 VcamMax 的 lastEnabledState 思路：
+//   只有读到明确值才更新缓存，读不到时保持上次已知状态
 __attribute__((used))
 static BOOL vplist_enabled(void) {
+    static BOOL sLastKnown = NO;
+    static BOOL sHasKnown = NO;
+    static NSLock *sLock = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ sLock = [NSLock new]; });
+
     NSDictionary *d = vplist_cached();
-    NSNumber *n = d[kEnableKey];
-    return n ? [n boolValue] : NO;
+    NSNumber *n = d ? d[kEnableKey] : nil;
+
+    if (n) {
+        [sLock lock];
+        sLastKnown = [n boolValue];
+        sHasKnown = YES;
+        [sLock unlock];
+        return sLastKnown;
+    }
+
+    // 缓存里读不到：直读一次
+    NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
+    NSNumber *fn = fresh ? fresh[kEnableKey] : nil;
+    if (fn) {
+        [sLock lock];
+        sLastKnown = [fn boolValue];
+        sHasKnown = YES;
+        [sLock unlock];
+        return sLastKnown;
+    }
+
+    // ★ 彻底读不到：返回上次已知状态（默认 NO）
+    [sLock lock];
+    BOOL r = sHasKnown ? sLastKnown : NO;
+    [sLock unlock];
+    return r;
 }
 
 __attribute__((used))
@@ -257,7 +286,6 @@ static void vl_logNewFormat(CVPixelBufferRef dst, const char *from) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteVideoDecoder
-//  ★ FIX-R: 读 preferredTransform
 // ══════════════════════════════════════════════════════════════════════
 typedef NS_ENUM(int, VLState) {
     VL_STATE_LOOP = 0,
@@ -271,7 +299,7 @@ typedef NS_ENUM(int, VLState) {
 - (void)stop;
 - (CVPixelBufferRef)latestFrameRetained CF_RETURNS_RETAINED;
 - (uint64_t)latestFrameID;
-- (int)preferredRotation;   // ★ FIX-R
+- (int)preferredRotation;
 - (void)seekToActionStartUs:(int64_t)startUs endUs:(int64_t)endUs;
 - (void)exitAction;
 @end
@@ -288,7 +316,7 @@ typedef NS_ENUM(int, VLState) {
     _Atomic int64_t _actionStartUs;
     _Atomic int64_t _actionEndUs;
     _Atomic int _actionDirty;
-    _Atomic int _preferredRotation;   // ★ FIX-R
+    _Atomic int _preferredRotation;
     double _fps;
 }
 
@@ -347,7 +375,7 @@ typedef NS_ENUM(int, VLState) {
 }
 
 - (uint64_t)latestFrameID { return atomic_load(&_frameID); }
-- (int)preferredRotation { return atomic_load(&_preferredRotation); }   // ★ FIX-R
+- (int)preferredRotation { return atomic_load(&_preferredRotation); }
 
 - (void)loopWithGen:(int)myGen {
     while (atomic_load(&_running) && atomic_load(&_gen) == myGen) {
@@ -368,7 +396,6 @@ typedef NS_ENUM(int, VLState) {
             if (tracks.count == 0) { sleep(1); continue; }
             AVAssetTrack *track = tracks[0];
 
-            // ★ FIX-R: 读取 preferredTransform 并缓存
             CGAffineTransform pt = track.preferredTransform;
             int rot = 0;
             if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0)       rot = 90;
@@ -464,7 +491,6 @@ typedef NS_ENUM(int, VLState) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteProcessor
-//  ★ FIX-R: 加 VTPixelRotationSession + rotateBuffer:byDegrees:
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCache : NSObject
 @property (nonatomic, assign) CVPixelBufferRef buf;
@@ -484,9 +510,8 @@ typedef NS_ENUM(int, VLState) {
 
 @interface LiteProcessor : NSObject
 - (BOOL)transfer:(CVPixelBufferRef)src srcID:(uint64_t)srcID into:(CVPixelBufferRef)dst;
-// ★ FIX-R: 旋转方法
 - (CVPixelBufferRef)rotateBuffer:(CVPixelBufferRef)src byDegrees:(int)deg CF_RETURNS_RETAINED;
-- (BOOL)rotationAvailable;   // ★ FIX-R
+- (BOOL)rotationAvailable;
 @end
 
 @implementation LiteProcessor {
@@ -497,7 +522,6 @@ typedef NS_ENUM(int, VLState) {
     NSLock *_vtLock;
     NSMutableDictionary<NSNumber *, LitePrivateCache *> *_privateCache;
 
-    // ★ FIX-R
     VTPixelRotationSessionRef _rotSess;
     BOOL _rotAvailable;
 }
@@ -509,7 +533,6 @@ typedef NS_ENUM(int, VLState) {
         _vtLock = [NSLock new];
         _privateCache = [NSMutableDictionary new];
 
-        // ★ FIX-R: 创建 VTPixelRotationSession
         _rotSess = NULL;
         _rotAvailable = NO;
         @try {
@@ -557,9 +580,8 @@ typedef NS_ENUM(int, VLState) {
     }
 }
 
-- (BOOL)rotationAvailable { return _rotAvailable; }   // ★ FIX-R
+- (BOOL)rotationAvailable { return _rotAvailable; }
 
-// ★ FIX-R: 旋转实现
 - (CVPixelBufferRef)rotateBuffer:(CVPixelBufferRef)src byDegrees:(int)deg CF_RETURNS_RETAINED {
     if (!src || deg == 0 || !_rotAvailable || !_rotSess) return NULL;
     deg = deg % 360; if (deg < 0) deg += 360;
@@ -767,7 +789,7 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteCore
-//  ★ FIX-R: 支持旋转（manualRotation 同步 + 叠加 preferredRotation）
+//  ★ FIX-U: enabled 加连续 NO 防抖
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -786,14 +808,14 @@ static BOOL vl_is_private_format(OSType fmt) {
     BOOL _actionInited;
     os_unfair_lock _coreLock;
 
-    // ★ FIX-R
-    int _manualRotation;              // 缓存的 plist manualRotation
+    int _manualRotation;
     NSInteger _lastSyncedManualRot;
-    // 旋转缓存（避免每帧重复旋转）
     CVPixelBufferRef _rotCache;
     uint64_t _rotCacheSrcID;
     int _rotCacheDeg;
     NSLock *_rotLock;
+
+    int _consecutiveNO;   // ★ FIX-U
 }
 
 + (instancetype)shared {
@@ -816,6 +838,8 @@ static BOOL vl_is_private_format(OSType fmt) {
         _rotCacheSrcID = 0;
         _rotCacheDeg = 0;
         _rotLock = [NSLock new];
+
+        _consecutiveNO = 0;
     }
     return self;
 }
@@ -839,6 +863,18 @@ static BOOL vl_is_private_format(OSType fmt) {
     BOOL plist = vplist_enabled();
     BOOL vid   = [[NSFileManager defaultManager] fileExistsAtPath:kVideoPath];
     BOOL en    = plist && vid;
+
+    // ★ FIX-U: 连续 3 次（1.5 秒）NO 才真正翻转
+    os_unfair_lock_lock(&_coreLock);
+    if (en) {
+        _consecutiveNO = 0;
+    } else {
+        _consecutiveNO++;
+        if (_consecutiveNO < 3 && _enabledCache) {
+            en = _enabledCache;
+        }
+    }
+    os_unfair_lock_unlock(&_coreLock);
 
     BOOL shouldStart = NO, shouldStop = NO;
     os_unfair_lock_lock(&_coreLock);
@@ -870,17 +906,14 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 - (void)checkActionFromPlist {
     NSDictionary *pl = vplist_cached();
-    // ★ FIX-P 配套：读失败不处理
     if (!pl) return;
 
-    // ★ FIX-R: 同步 manualRotation
     NSNumber *mr = pl[kManualRotKey];
     NSInteger curManualRot = mr ? [mr integerValue] : 0;
     if (curManualRot != _lastSyncedManualRot) {
         _lastSyncedManualRot = curManualRot;
         _manualRotation = (int)(curManualRot % 360);
         if (_manualRotation < 0) _manualRotation += 360;
-        // 清旋转缓存（角度变了）
         [_rotLock lock];
         if (_rotCache) { CVPixelBufferRelease(_rotCache); _rotCache = NULL; }
         _rotCacheSrcID = 0;
@@ -960,15 +993,13 @@ static BOOL vl_is_private_format(OSType fmt) {
     CVPixelBufferRef src = [_dec latestFrameRetained];
     if (!src) return;
 
-    // ★ FIX-R: 计算总旋转
     int preferred = [_dec preferredRotation];
     int manual = _manualRotation;
     int totalRot = (preferred + manual) % 360;
     if (totalRot < 0) totalRot += 360;
 
-    // ★ FIX-R: 按 srcID 缓存旋转结果
     CVPixelBufferRef srcToTransfer = src;
-    CVPixelBufferRef rotatedTmp = NULL;   // 由我们负责 release
+    CVPixelBufferRef rotatedTmp = NULL;
     if (totalRot != 0 && [_proc rotationAvailable]) {
         [_rotLock lock];
         if (_rotCache && _rotCacheSrcID == srcID && _rotCacheDeg == totalRot && srcID != 0) {
@@ -1014,7 +1045,7 @@ static BOOL vl_is_private_format(OSType fmt) {
 @end
 
 // ══════════════════════════════════════════════════════════════════════
-//  Hook 层（v2.3 原样）
+//  Hook 层
 // ══════════════════════════════════════════════════════════════════════
 static NSMutableDictionary<NSValue *, NSValue *> *gOrigIMP = nil;
 static _Atomic int gInstalled = 0;
@@ -1275,8 +1306,6 @@ static void *install_thread(void *arg) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  UI 层
-//  ★ FIX-R: 加"旋转"按钮
-//  ★ FIX-S: VLHitThroughView 面板穿透 + 拖动关面板
 // ══════════════════════════════════════════════════════════════════════
 @interface VLWindow : UIWindow @end
 @implementation VLWindow
@@ -1287,7 +1316,6 @@ static void *install_thread(void *arg) {
 }
 @end
 
-// ★ FIX-S: 面板空白区穿透
 @interface VLHitThroughView : UIView @end
 @implementation VLHitThroughView
 - (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event {
@@ -1395,7 +1423,6 @@ static void *install_thread(void *arg) {
 }
 
 - (void)ballDragged:(UIPanGestureRecognizer *)g {
-    // ★ FIX-S: 开始拖动时先关面板，避免重叠遮挡
     if (g.state == UIGestureRecognizerStateBegan && _panel) {
         [self dismissPanel];
     }
@@ -1415,7 +1442,6 @@ static void *install_thread(void *arg) {
     CGFloat w = _panel.frame.size.width;
     CGFloat h = _panel.frame.size.height;
 
-    // ★ FIX-S: 优先右→左→上→下
     CGRect ballF = _ball.frame;
     CGFloat screenW = _win.bounds.size.width;
     CGFloat screenH = _win.bounds.size.height;
@@ -1473,7 +1499,6 @@ static void *install_thread(void *arg) {
     CGFloat contentH = MAX(controlH, timeH);
     CGFloat h = pad + tabH + tabGap + contentH + pad;
 
-    // ★ FIX-S: 用 VLHitThroughView 让空白区穿透
     _panel = [[VLHitThroughView alloc] initWithFrame:CGRectMake(0, 0, w, h)];
     _panel.backgroundColor = [UIColor colorWithRed:0.24 green:0.25 blue:0.27 alpha:0.96];
     _panel.layer.cornerRadius = 12;
@@ -1566,7 +1591,6 @@ static void *install_thread(void *arg) {
     [_pageControl addSubview:_toggleBtn];
     y += row1H + gap;
 
-    // ★ FIX-R: 第二行改为四等分：旋转 / 眨 / 嘴 / 头
     CGFloat row2H = 48;
     CGFloat qW = (w - gap * 3) / 4.0;
 
@@ -1624,7 +1648,6 @@ static void *install_thread(void *arg) {
     [b setTitle:(!en ? @"禁用相机" : @"启用相机") forState:UIControlStateNormal];
 }
 
-// ★ FIX-R: 旋转按钮 —— 每次 +90
 - (void)rotateTapped {
     vplist_update(^(NSMutableDictionary *d) {
         NSInteger old = [d[kManualRotKey] integerValue];
@@ -1660,7 +1683,6 @@ static void *install_thread(void *arg) {
                 NSNumber *oldTok = d[kActionToken];
                 d[kActionToken] = @([oldTok longLongValue] + 1);
                 d[kActionActive] = @0;
-                // ★ FIX-R: 换视频时重置旋转
                 d[kManualRotKey] = @0;
             });
         } else {
@@ -1740,7 +1762,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.1", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.2", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1751,7 +1773,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.1", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.2", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
