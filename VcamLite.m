@@ -1,15 +1,15 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.4
+//  VcamLite.m — 融合版相机替换内核 v2.5
 //  v2.2：私有 Lossy 格式（&xv0 / &8v0 等）直转
 //  v2.3：修复视频模式闪烁/黑屏（render 去重 + VT session 锁 + 私有格式 srcID 缓存）
-//  v2.4：修复日志暴露的 4 项问题
-//        FIX-A  plist 缓存判据 mtime → mtime+inode+size 三维
-//        FIX-B  decoder 动作完成判定改用 _actionVersion 单调版本号
-//        FIX-C  hook body 内新增相机管线白名单（不窄化 85 类 hook 范围）
-//        FIX-D  attachment 传播模式 ShouldNotPropagate → ShouldPropagate
-//        FIX-E  latestFrameRetainedWithID: 原子配对（消除 srcID/src 竞争）
-//        FIX-F  私有 lane IOSurface 时间窗口守卫（防 ID 复用）
-//        FIX-G  decoder 内部 done -> frozen 改 vlog_always 便于时序核验
+//  v2.4：FIX-A plist 三维判据 / FIX-B _actionVersion / FIX-C 相机管线白名单
+//        FIX-D ShouldPropagate / FIX-E latestFrameRetainedWithID / FIX-F IOSurface 时间窗口
+//        FIX-G done->frozen 用 vlog_always
+//  v2.5：修复三个新发现的问题
+//        FIX-H  视频方向：读 preferredTransform，用 CIImage 按 srcID 缓存旋转
+//        FIX-I  plist 缓存容错：读失败时保留旧 cache
+//        FIX-J  enabled 兜底：plist 短暂失效时保留上次状态
+//        FIX-K  悬浮球拖动时自动关面板，避免遮挡面板按钮
 //
 
 #import <Foundation/Foundation.h>
@@ -19,6 +19,7 @@
 #import <AVFoundation/AVFoundation.h>
 #import <CoreVideo/CoreVideo.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreImage/CoreImage.h>
 #import <VideoToolbox/VideoToolbox.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
@@ -154,17 +155,15 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  plist
-//  ★ FIX-A: 缓存判据 mtime → mtime + inode + size
-//   理由：writeToFile:atomically:YES 内部走 rename，目标 inode 一定变；
-//         VFS 可能对 mtime 命中旧缓存，导致读到上一次的 actionActive。
-//         加入 inode + size 两维后，任一变化即刷新，缓存架构完整保留。
+//  ★ FIX-A: 判据 mtime+inode+size
+//  ★ FIX-I: 读失败时保留旧 cache（plist 原子写入窗口期）
 // ══════════════════════════════════════════════════════════════════════
 __attribute__((used))
 static NSDictionary *vplist_cached(void) {
     static NSDictionary *cache = nil;
     static double  lastMtime = -1;
-    static ino_t   lastInode = 0;       // ★ FIX-A
-    static off_t   lastSize  = -1;      // ★ FIX-A
+    static ino_t   lastInode = 0;
+    static off_t   lastSize  = -1;
     static NSLock *lk = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ lk = [NSLock new]; });
@@ -173,19 +172,29 @@ static NSDictionary *vplist_cached(void) {
     double m   = -1;
     ino_t  ino = 0;
     off_t  sz  = -1;
-    if (stat(kPlistPath.fileSystemRepresentation, &st) == 0) {
+    BOOL statOK = (stat(kPlistPath.fileSystemRepresentation, &st) == 0);
+    if (statOK) {
         m   = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
         ino = st.st_ino;
         sz  = st.st_size;
     }
 
     [lk lock];
-    // ★ FIX-A: 三维判据，任一变化即刷新；缓存机制原样保留
     if (m != lastMtime || ino != lastInode || sz != lastSize || !cache) {
-        lastMtime = m;
-        lastInode = ino;
-        lastSize  = sz;
-        cache = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
+        NSDictionary *newCache = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
+        // ★ FIX-I: 只有读到合法内容才更新 cache
+        if (newCache) {
+            lastMtime = m;
+            lastInode = ino;
+            lastSize  = sz;
+            cache = newCache;
+        } else if (!statOK) {
+            // stat 失败：更新判据避免反复 stat，但保留 cache
+            lastMtime = m;
+            lastInode = ino;
+            lastSize  = sz;
+        }
+        // 否则：plist 正在原子写入中，保留旧 cache，下次重试
     }
     NSDictionary *r = cache;
     [lk unlock];
@@ -266,8 +275,9 @@ static void vl_logNewFormat(CVPixelBufferRef dst, const char *from) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteVideoDecoder
-//  ★ FIX-B: 新增 _actionVersion 单调版本号
-//  ★ FIX-E: 新增 latestFrameRetainedWithID: 原子配对读
+//  ★ FIX-B: _actionVersion 单调版本号
+//  ★ FIX-E: latestFrameRetainedWithID: 原子配对
+//  ★ FIX-H: preferredRotation 读取
 // ══════════════════════════════════════════════════════════════════════
 typedef NS_ENUM(int, VLState) {
     VL_STATE_LOOP = 0,
@@ -280,9 +290,9 @@ typedef NS_ENUM(int, VLState) {
 - (void)start;
 - (void)stop;
 - (CVPixelBufferRef)latestFrameRetained CF_RETURNS_RETAINED;
-// ★ FIX-E: 在同一临界区内同时取出 (src, srcID)，消除 replaceInPlace 的竞争
 - (CVPixelBufferRef)latestFrameRetainedWithID:(uint64_t *)outID CF_RETURNS_RETAINED;
 - (uint64_t)latestFrameID;
+- (int)preferredRotation;                    // ★ FIX-H
 - (void)seekToActionStartUs:(int64_t)startUs endUs:(int64_t)endUs;
 - (void)exitAction;
 @end
@@ -298,8 +308,9 @@ typedef NS_ENUM(int, VLState) {
     _Atomic int _state;
     _Atomic int64_t _actionStartUs;
     _Atomic int64_t _actionEndUs;
-    _Atomic int _actionDirty;         // 保留：早跳出信号
-    _Atomic uint64_t _actionVersion;  // ★ FIX-B: 单调递增，任何 seek/exit 都 +1
+    _Atomic int _actionDirty;
+    _Atomic uint64_t _actionVersion;
+    _Atomic int _preferredRotation;              // ★ FIX-H
     double _fps;
 }
 
@@ -311,6 +322,7 @@ typedef NS_ENUM(int, VLState) {
         _fps = 30.0;
         atomic_store(&_state, VL_STATE_LOOP);
         atomic_store(&_actionVersion, 0);
+        atomic_store(&_preferredRotation, 0);
     }
     return self;
 }
@@ -341,14 +353,14 @@ typedef NS_ENUM(int, VLState) {
     atomic_store(&_actionStartUs, startUs);
     atomic_store(&_actionEndUs, endUs);
     atomic_store(&_state, VL_STATE_ACTION);
-    atomic_store(&_actionDirty, 1);             // 保留
-    atomic_fetch_add(&_actionVersion, 1);       // ★ FIX-B
+    atomic_store(&_actionDirty, 1);
+    atomic_fetch_add(&_actionVersion, 1);
 }
 
 - (void)exitAction {
     atomic_store(&_state, VL_STATE_LOOP);
-    atomic_store(&_actionDirty, 1);             // 保留
-    atomic_fetch_add(&_actionVersion, 1);       // ★ FIX-B
+    atomic_store(&_actionDirty, 1);
+    atomic_fetch_add(&_actionVersion, 1);
 }
 
 - (CVPixelBufferRef)latestFrameRetained {
@@ -359,7 +371,6 @@ typedef NS_ENUM(int, VLState) {
     return pb;
 }
 
-// ★ FIX-E: 原子配对——同一临界区内同时读 frame + frameID
 - (CVPixelBufferRef)latestFrameRetainedWithID:(uint64_t *)outID {
     os_unfair_lock_lock(&_frameLock);
     CVPixelBufferRef pb = _frame;
@@ -370,6 +381,8 @@ typedef NS_ENUM(int, VLState) {
 }
 
 - (uint64_t)latestFrameID { return atomic_load(&_frameID); }
+
+- (int)preferredRotation { return atomic_load(&_preferredRotation); }  // ★ FIX-H
 
 - (void)loopWithGen:(int)myGen {
     while (atomic_load(&_running) && atomic_load(&_gen) == myGen) {
@@ -389,6 +402,17 @@ typedef NS_ENUM(int, VLState) {
             NSArray *tracks = [asset tracksWithMediaType:AVMediaTypeVideo];
             if (tracks.count == 0) { sleep(1); continue; }
             AVAssetTrack *track = tracks[0];
+
+            // ★ FIX-H: 读取 preferredTransform 并缓存
+            CGAffineTransform pt = track.preferredTransform;
+            int rot = 0;
+            if (pt.a == 0 && pt.b == 1 && pt.c == -1 && pt.d == 0)       rot = 90;
+            else if (pt.a == -1 && pt.b == 0 && pt.c == 0 && pt.d == -1) rot = 180;
+            else if (pt.a == 0 && pt.b == -1 && pt.c == 1 && pt.d == 0)  rot = 270;
+            if (rot != atomic_load(&_preferredRotation)) {
+                atomic_store(&_preferredRotation, rot);
+                vlog_always(@"decoder", @"preferredRotation = %d", rot);
+            }
 
             double nominal = track.nominalFrameRate;
             if (nominal > 1.0 && nominal < 240.0) _fps = nominal;
@@ -433,7 +457,6 @@ typedef NS_ENUM(int, VLState) {
 
             if (![reader startReading]) { sleep(1); continue; }
 
-            // ★ FIX-B: 捕获本轮 reader 的版本号
             uint64_t myVer = atomic_load(&_actionVersion);
 
             NSTimeInterval nextTick = CACurrentMediaTime();
@@ -441,7 +464,6 @@ typedef NS_ENUM(int, VLState) {
                    atomic_load(&_gen) == myGen &&
                    reader.status == AVAssetReaderStatusReading) {
                 if (atomic_load(&_gen) != myGen) break;
-                // ★ FIX-B: 版本变化立即跳出（比 dirty 更精确）
                 if (atomic_load(&_actionVersion) != myVer) break;
                 if (atomic_load(&_state) != (int)st) break;
 
@@ -466,7 +488,6 @@ typedef NS_ENUM(int, VLState) {
             }
             [reader cancelReading];
 
-            // ★ FIX-B: 完成判定改用版本号——只有版本号没变 + state 仍是 ACTION 才算自然完成
             int curState = atomic_load(&_state);
             uint64_t curVer = atomic_load(&_actionVersion);
             BOOL completed = (curVer == myVer) &&
@@ -475,7 +496,7 @@ typedef NS_ENUM(int, VLState) {
             if (completed) {
                 atomic_store(&_state, VL_STATE_FROZEN);
                 vlog_always(@"action", @"done -> frozen (ver=%llu)",
-                            (unsigned long long)myVer);   // ★ FIX-G
+                            (unsigned long long)myVer);
             } else if (curVer != myVer) {
                 vlog_always(@"action", @"interrupted (ver %llu -> %llu)",
                             (unsigned long long)myVer, (unsigned long long)curVer);
@@ -490,6 +511,7 @@ typedef NS_ENUM(int, VLState) {
 // ══════════════════════════════════════════════════════════════════════
 //  LiteProcessor
 //  ★ FIX-F: 私有 lane IOSurface 时间窗口守卫
+//  ★ FIX-H: CIImage 旋转 + srcID 缓存
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCache : NSObject
 @property (nonatomic, assign) CVPixelBufferRef buf;
@@ -509,15 +531,29 @@ typedef NS_ENUM(int, VLState) {
 
 @interface LiteProcessor : NSObject
 - (BOOL)transfer:(CVPixelBufferRef)src srcID:(uint64_t)srcID into:(CVPixelBufferRef)dst;
+// ★ FIX-H: 按 srcID 缓存旋转后的 buffer
+- (CVPixelBufferRef)rotatedBufferForSrc:(CVPixelBufferRef)src
+                                    deg:(int)deg
+                                  srcID:(uint64_t)srcID
+                     CF_RETURNS_RETAINED;
 @end
 
 @implementation LiteProcessor {
-    VTPixelTransferSessionRef _sess;       // RealTime（标准格式快路径）
-    VTPixelTransferSessionRef _slowSess;   // 非 RealTime（私有/lossy 格式直转）
+    VTPixelTransferSessionRef _sess;
+    VTPixelTransferSessionRef _slowSess;
     NSRecursiveLock *_lock;
     NSMutableDictionary<NSString *, LiteCache *> *_caches;
     NSLock *_vtLock;
     NSMutableDictionary<NSNumber *, LitePrivateCache *> *_privateCache;
+
+    // ★ FIX-H
+    CIContext *_rotCtx;
+    CVPixelBufferRef _rotCache;
+    uint64_t _rotCacheSrcID;
+    int _rotCacheDeg;
+    size_t _rotCacheW;
+    size_t _rotCacheH;
+    NSLock *_rotLock;
 }
 
 - (instancetype)init {
@@ -526,6 +562,16 @@ typedef NS_ENUM(int, VLState) {
         _caches = [NSMutableDictionary new];
         _vtLock = [NSLock new];
         _privateCache = [NSMutableDictionary new];
+
+        _rotLock = [NSLock new];
+        _rotCache = NULL;
+        _rotCacheSrcID = 0;
+        _rotCacheDeg = 0;
+        @try {
+            _rotCtx = [CIContext contextWithOptions:nil];
+        } @catch (NSException *e) {
+            _rotCtx = nil;
+        }
 
         OSStatus s = VTPixelTransferSessionCreate(kCFAllocatorDefault, &_sess);
         if (s != noErr || !_sess) { _sess = NULL; return self; }
@@ -546,6 +592,79 @@ typedef NS_ENUM(int, VLState) {
 - (void)dealloc {
     if (_sess) { VTPixelTransferSessionInvalidate(_sess); CFRelease(_sess); }
     if (_slowSess) { VTPixelTransferSessionInvalidate(_slowSess); CFRelease(_slowSess); }
+    if (_rotCache) { CVPixelBufferRelease(_rotCache); _rotCache = NULL; }
+}
+
+// ★ FIX-H: 按 srcID 缓存旋转
+- (CVPixelBufferRef)rotatedBufferForSrc:(CVPixelBufferRef)src
+                                    deg:(int)deg
+                                  srcID:(uint64_t)srcID
+                     CF_RETURNS_RETAINED {
+    if (!src || deg == 0) return NULL;
+    if (!_rotCtx) return NULL;
+
+    [_rotLock lock];
+
+    // 缓存命中
+    if (_rotCache && _rotCacheSrcID == srcID && _rotCacheDeg == deg && srcID != 0) {
+        CVPixelBufferRef r = CVPixelBufferRetain(_rotCache);
+        [_rotLock unlock];
+        return r;
+    }
+
+    size_t sw = CVPixelBufferGetWidth(src);
+    size_t sh = CVPixelBufferGetHeight(src);
+    size_t ow = (deg == 90 || deg == 270) ? sh : sw;
+    size_t oh = (deg == 90 || deg == 270) ? sw : sh;
+
+    // 复用或新建
+    if (!_rotCache || _rotCacheW != ow || _rotCacheH != oh) {
+        if (_rotCache) { CVPixelBufferRelease(_rotCache); _rotCache = NULL; }
+        NSDictionary *attrs = @{
+            (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+            (id)kCVPixelBufferWidthKey:  @(ow),
+            (id)kCVPixelBufferHeightKey: @(oh),
+            (id)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        CVPixelBufferRef nb = NULL;
+        if (CVPixelBufferCreate(kCFAllocatorDefault, ow, oh,
+                                kCVPixelFormatType_32BGRA,
+                                (__bridge CFDictionaryRef)attrs, &nb) != kCVReturnSuccess || !nb) {
+            [_rotLock unlock];
+            return NULL;
+        }
+        _rotCache = nb;
+        _rotCacheW = ow;
+        _rotCacheH = oh;
+    }
+
+    // CI 旋转
+    CIImage *img = [CIImage imageWithCVPixelBuffer:src];
+    if (!img) { [_rotLock unlock]; return NULL; }
+    int orient = 1;
+    if (deg == 90)       orient = 6;   // 顺时针 90
+    else if (deg == 180) orient = 3;
+    else if (deg == 270) orient = 8;   // 顺时针 270（=逆时针 90）
+    CIImage *rotated = [img imageByApplyingOrientation:orient];
+
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    @try {
+        [_rotCtx render:rotated toCVPixelBuffer:_rotCache
+                 bounds:CGRectMake(0, 0, ow, oh)
+             colorSpace:cs];
+    } @catch (NSException *e) {
+        CGColorSpaceRelease(cs);
+        [_rotLock unlock];
+        return NULL;
+    }
+    CGColorSpaceRelease(cs);
+
+    _rotCacheSrcID = srcID;
+    _rotCacheDeg = deg;
+
+    CVPixelBufferRef r = CVPixelBufferRetain(_rotCache);
+    [_rotLock unlock];
+    return r;
 }
 
 static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
@@ -587,9 +706,9 @@ static BOOL vmemcpy(CVPixelBufferRef src, CVPixelBufferRef dst) {
 
 static BOOL vl_is_private_format(OSType fmt) {
     if (fmt == kCVPixelFormatType_32BGRA) return NO;
-    if (fmt == 0x34323076) return NO;  // '420v'
-    if (fmt == 0x34323066) return NO;  // '420f'
-    if (fmt == 0x70343230) return NO;  // 'p420'
+    if (fmt == 0x34323076) return NO;
+    if (fmt == 0x34323066) return NO;
+    if (fmt == 0x70343230) return NO;
     return YES;
 }
 
@@ -599,9 +718,6 @@ static BOOL vl_is_private_format(OSType fmt) {
     size_t dh = CVPixelBufferGetHeight(dst);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
-    // ═════════════════════════════════════════════════════════════
-    // 私有/lossy 格式：直转（子线路）
-    // ═════════════════════════════════════════════════════════════
     if (vl_is_private_format(fmt)) {
         IOSurfaceRef surf = CVPixelBufferGetIOSurface(dst);
         uint32_t surfID = surf ? IOSurfaceGetID(surf) : 0;
@@ -610,14 +726,13 @@ static BOOL vl_is_private_format(OSType fmt) {
         [_lock lock];
         LitePrivateCache *pc = _privateCache[cacheKey];
         if (pc && pc.srcID == srcID && srcID != 0) {
-            // ★ FIX-F: 时间窗口守卫——超过 2s 认为是 IOSurface 复用，强制重新 VT
             CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
             if (now - pc.lastUse < 2.0) {
                 pc.lastUse = now;
                 [_lock unlock];
                 return YES;
             }
-            pc.srcID = 0;  // 超时：清掉旧 srcID
+            pc.srcID = 0;
         }
         if (!pc) {
             pc = [LitePrivateCache new];
@@ -672,9 +787,6 @@ static BOOL vl_is_private_format(OSType fmt) {
         return s == noErr;
     }
 
-    // ═════════════════════════════════════════════════════════════
-    // 标准格式：cache 快路径（主线路）
-    // ═════════════════════════════════════════════════════════════
     NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dw, dh, (unsigned)fmt];
 
     [_lock lock];
@@ -712,6 +824,8 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteCore
+//  ★ FIX-J: enabled 兜底
+//  ★ FIX-H: replaceInPlace 里做旋转
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -760,9 +874,19 @@ static BOOL vl_is_private_format(OSType fmt) {
     _lastCheck = now;
     os_unfair_lock_unlock(&_coreLock);
 
-    BOOL plist = vplist_enabled();
-    BOOL vid   = [[NSFileManager defaultManager] fileExistsAtPath:kVideoPath];
-    BOOL en    = plist && vid;
+    NSDictionary *plistDict = vplist_cached();
+    BOOL vid = [[NSFileManager defaultManager] fileExistsAtPath:kVideoPath];
+    BOOL plist = NO;
+    if (plistDict) {
+        NSNumber *n = plistDict[kEnableKey];
+        plist = n ? [n boolValue] : NO;
+    }
+    BOOL en = plist && vid;
+
+    // ★ FIX-J: plist 短暂失效（dict == nil）时保留上次状态
+    if (!plistDict && vid && _enabledCache) {
+        en = YES;
+    }
 
     BOOL shouldStart = NO, shouldStop = NO;
     os_unfair_lock_lock(&_coreLock);
@@ -794,6 +918,7 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 - (void)checkActionFromPlist {
     NSDictionary *pl = vplist_cached();
+    if (!pl) return;   // ★ FIX-I: 读不到就不动状态
     NSNumber *t = pl[kActionToken];
     NSNumber *a = pl[kActionActive];
     int64_t tok = t ? [t longLongValue] : 0;
@@ -863,10 +988,29 @@ static BOOL vl_is_private_format(OSType fmt) {
                                w, h, (unsigned)fmt, from);
     }
 
-    // ★ FIX-E: 原子配对取 (src, srcID)
+    // ★ FIX-E: 原子配对
     uint64_t srcID = 0;
     CVPixelBufferRef src = [_dec latestFrameRetainedWithID:&srcID];
     if (!src || srcID == 0) { if (src) CVPixelBufferRelease(src); return; }
+
+    // ★ FIX-H: 方向纠正（按 srcID 缓存）
+    int rot = [_dec preferredRotation];
+    CVPixelBufferRef srcToTransfer = src;
+    CVPixelBufferRef rotated = NULL;
+    if (rot != 0) {
+        rotated = [_proc rotatedBufferForSrc:src deg:rot srcID:srcID];
+        if (rotated) {
+            srcToTransfer = rotated;
+        } else {
+            // 旋转失败时，退化为不旋转
+            static CFAbsoluteTime lastLog = 0;
+            CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+            if (now - lastLog > 5.0) {
+                lastLog = now;
+                vlog_always(@"rotate", @"rotate failed, fallback to raw src");
+            }
+        }
+    }
 
     static NSMutableSet<NSString *> *sDone = nil;
     static NSLock *sDL = nil;
@@ -880,11 +1024,12 @@ static BOOL vl_is_private_format(OSType fmt) {
     if (firstLog) [sDone addObject:k];
     [sDL unlock];
 
-    BOOL ok = [_proc transfer:src srcID:srcID into:dst];
+    BOOL ok = [_proc transfer:srcToTransfer srcID:srcID into:dst];
     if (firstLog) {
-        vlog_always(@"replace", @"REPLACE[%s] %zux%zu fmt=0x%x ok=%d",
-                    from, w, h, (unsigned)fmt, ok);
+        vlog_always(@"replace", @"REPLACE[%s] %zux%zu fmt=0x%x rot=%d ok=%d",
+                    from, w, h, (unsigned)fmt, rot, ok);
     }
+    if (rotated) CVPixelBufferRelease(rotated);
     CVPixelBufferRelease(src);
 }
 
@@ -892,8 +1037,6 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  Hook 层
-//  ★ FIX-C: hook 挂接层完全不变（全量 85 类），新增 hook body 内白名单
-//  ★ FIX-D: attachment 传播模式 ShouldNotPropagate → ShouldPropagate
 // ══════════════════════════════════════════════════════════════════════
 static NSMutableDictionary<NSValue *, NSValue *> *gOrigIMP = nil;
 static _Atomic int gInstalled = 0;
@@ -930,28 +1073,23 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
-// ★ FIX-C: 相机管线白名单——保留全部 hook，在 hook body 内过滤非相机数据
 __attribute__((used))
 static BOOL vl_is_camera_pipeline_output(id node, CMSampleBufferRef sb, CVPixelBufferRef pb) {
     if (!sb || !pb) return NO;
 
-    // 1) 视频 mediaType
     CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb);
     if (!fd || CMFormatDescriptionGetMediaType(fd) != kCMMediaType_Video) return NO;
 
-    // 2) BW 节点自报 mediaType（不存在则默认通过）
     SEL mtSel = sel_registerName("mediaType");
     if ([node respondsToSelector:mtSel]) {
         uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(node, mtSel);
         if (mt != 0 && mt != 'vide') return NO;
     }
 
-    // 3) 尺寸合理区间
     size_t w = CVPixelBufferGetWidth(pb);
     size_t h = CVPixelBufferGetHeight(pb);
     if (w < 64 || h < 64 || w > 8192 || h > 8192) return NO;
 
-    // 4) 类名前缀黑名单（这些节点不处理相机流）
     const char *cls = object_getClassName(node);
     static const char *kBlacklistPrefixes[] = {
         "BWPhotoDecompressor",
@@ -983,16 +1121,13 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
 
     @autoreleasepool {
         if (sb) {
-            // ★ 保留 attachment 去重
             CFTypeRef processed = CMGetAttachment(sb, kVLProcessedKey, NULL);
             BOOL alreadyProcessed = (processed != NULL &&
                                      CFGetTypeID(processed) == CFBooleanGetTypeID() &&
                                      CFBooleanGetValue((CFBooleanRef)processed));
             if (!alreadyProcessed && [LiteCore.shared enabled]) {
                 CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-                // ★ FIX-C: 白名单过滤（保留全部 hook，只过滤非相机数据）
                 if (vl_is_camera_pipeline_output(_self, sb, pb)) {
-                    // ★ FIX-D: ShouldPropagate（同帧全链路只替换一次）
                     CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
                                     kCMAttachmentMode_ShouldPropagate);
                     @try {
@@ -1027,9 +1162,7 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
                                      CFBooleanGetValue((CFBooleanRef)processed));
             if (!alreadyProcessed) {
                 CVPixelBufferRef pb = CMSampleBufferGetImageBuffer(sb);
-                // ★ FIX-C: 同样走白名单
                 if (vl_is_camera_pipeline_output(_self, sb, pb)) {
-                    // ★ FIX-D: ShouldPropagate
                     CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
                                     kCMAttachmentMode_ShouldPropagate);
                     @try {
@@ -1071,7 +1204,6 @@ static BOOL hook_class_method(Class cls, SEL sel, IMP newImp, BOOL requireOwns) 
     return YES;
 }
 
-// ★ 保留：全量 hook 所有 BWNodeOutput 子类
 __attribute__((used))
 static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     Class base = objc_getClass(baseName);
@@ -1093,7 +1225,6 @@ static int hook_all_subclasses(const char *baseName, SEL sel, IMP newImp) {
     return hooked;
 }
 
-// ★ 保留：全量 hook 所有 BW* 类的 render/emit
 __attribute__((used))
 static int hook_all_render_classes(void) {
     int hooked = 0;
@@ -1198,7 +1329,8 @@ static void *install_thread(void *arg) {
 }
 
 // ══════════════════════════════════════════════════════════════════════
-//  UI 层（完全保留）
+//  UI 层
+//  ★ FIX-K: ballDragged 拖动时关面板
 // ══════════════════════════════════════════════════════════════════════
 @interface VLWindow : UIWindow @end
 @implementation VLWindow
@@ -1311,6 +1443,10 @@ static void *install_thread(void *arg) {
 }
 
 - (void)ballDragged:(UIPanGestureRecognizer *)g {
+    // ★ FIX-K: 开始拖动时关面板，避免球和面板重叠导致面板按钮点不到
+    if (g.state == UIGestureRecognizerStateBegan && _panel) {
+        [self dismissPanel];
+    }
     CGPoint t = [g translationInView:_win];
     CGPoint c = CGPointMake(_ball.center.x + t.x, _ball.center.y + t.y);
     CGFloat hw = _ball.frame.size.width / 2;
@@ -1326,9 +1462,22 @@ static void *install_thread(void *arg) {
     if (!_panel || !_ball || !_win) return;
     CGFloat w = _panel.frame.size.width;
     CGFloat h = _panel.frame.size.height;
-    CGFloat px = _ball.frame.origin.x - w - 8;
-    if (px < 5) px = CGRectGetMaxX(_ball.frame) + 8;
-    if (px + w > _win.bounds.size.width - 5) px = 5;
+
+    // ★ 优先放右边，放不下放左边，都不行贴左
+    CGFloat ballMaxX = CGRectGetMaxX(_ball.frame);
+    CGFloat ballMinX = _ball.frame.origin.x;
+    CGFloat rightX = ballMaxX + 8;
+    CGFloat leftX  = ballMinX - w - 8;
+
+    CGFloat px;
+    if (rightX + w <= _win.bounds.size.width - 5) {
+        px = rightX;
+    } else if (leftX >= 5) {
+        px = leftX;
+    } else {
+        px = 5;
+    }
+
     CGFloat py = _ball.center.y - h / 2;
     if (py < 5) py = 5;
     if (py + h > _win.bounds.size.height - 5) py = _win.bounds.size.height - h - 5;
@@ -1589,7 +1738,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.4", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.5", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1600,7 +1749,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.4", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.5", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
