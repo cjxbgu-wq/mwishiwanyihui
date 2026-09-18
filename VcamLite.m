@@ -1,15 +1,15 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.3.4
+//  VcamLite.m — 融合版相机替换内核 v2.3.5
 //  v2.3：私有 Lossy 格式直转 + render 去重 + VT session 锁 + 私有格式 srcID 缓存
 //  v2.3.1：FIX-P/Q/R/S
 //  v2.3.2：FIX-T (vplist_enabled lastKnown) + FIX-U (enabled 防抖)
 //  v2.3.3：FIX-V (vid 优先 + 6 次防抖)
-//  v2.3.4（彻底修"微信扫一扫时按动作键还原真实相机"）：
-//        FIX-W  新增 plist 字段 userExplicitDisable
-//               - 只有"禁用相机"按钮才写 userExplicitDisable=YES
-//               - 动作按钮 / 换视频 / 旋转 都不动这个字段
-//        FIX-X  LiteCore.enabled：只有 vid 消失 或 userExplicitDisable=YES 才禁用
-//               其他一切情况都保持启用 → 动作按钮 100% 不影响
+//  v2.3.4：FIX-W (userExplicitDisable) + FIX-X (只有 vid 消失或用户禁用才翻转)
+//  v2.3.5（针对"微信扫一扫点击动作抖动 + 还原真相机"）：
+//        FIX-Y1  vplist_cached 去掉 mtime 缓存，直接读
+//        FIX-Y2  ShouldNotPropagate → ShouldPropagate（去重）
+//        FIX-Y3  vl_render_body 也调用 checkActionFromPlist
+//        FIX-Y4  enabled 的 vid 加 5 次防抖（DCIM 目录繁忙时 fileExistsAtPath 瞬时失败）
 //
 
 #import <Foundation/Foundation.h>
@@ -44,7 +44,7 @@ static NSString *const kPlistPath = @"/var/mobile/Media/DCIM/vc.plist";
 static const char *const kNotifyAction = "com.vlite.action.changed";
 
 static NSString *const kEnableKey          = @"enabled";
-static NSString *const kUserDisableKey     = @"userExplicitDisable";   // ★ FIX-W
+static NSString *const kUserDisableKey     = @"userExplicitDisable";
 static NSString *const kActionToken        = @"actionToken";
 static NSString *const kActionActive       = @"actionActive";
 static NSString *const kManualRotKey       = @"manualRotation";
@@ -139,34 +139,16 @@ static void vlog(NSString *tag, NSString *fmt, ...) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  plist
+//  ★ FIX-Y1: vplist_cached 直接读，无 mtime 缓存
 // ══════════════════════════════════════════════════════════════════════
 __attribute__((used))
 static NSDictionary *vplist_cached(void) {
-    static NSDictionary *cache = nil;
-    static double lastMtime = -1;
-    static NSLock *lk = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{ lk = [NSLock new]; });
-
-    struct stat st;
-    double m = -1;
-    if (stat(kPlistPath.fileSystemRepresentation, &st) == 0) {
-        m = (double)st.st_mtimespec.tv_sec + (double)st.st_mtimespec.tv_nsec / 1e9;
-    }
-
-    [lk lock];
-    if (m != lastMtime || !cache) {
-        NSDictionary *newCache = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
-        if (newCache) {
-            lastMtime = m;
-            cache = newCache;
-        } else if (!cache) {
-            lastMtime = m;
-        }
-    }
-    NSDictionary *r = cache;
-    [lk unlock];
-    return r;
+    // v2.3.5 FIX-Y1: 去掉 mtime 缓存，直接读
+    // 原因：writeToFile:atomically:YES 走临时文件 + rename 路径，
+    //      APFS/VFS 的 st_mtimespec 更新可能在 rename 后仍有延迟，
+    //      导致连续快速写入（动作按钮点击）时 mediaserverd 检测不到变化。
+    // plist 只有几百字节，直接读 < 100µs，每秒 30 次调用 CPU 消耗可忽略。
+    return [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
 }
 
 __attribute__((used))
@@ -223,14 +205,12 @@ static BOOL vplist_enabled(void) {
     return r;
 }
 
-// ★ FIX-W: 读 userExplicitDisable 字段
 __attribute__((used))
 static BOOL vplist_userExplicitDisable(void) {
     NSDictionary *d = vplist_cached();
     NSNumber *n = d ? d[kUserDisableKey] : nil;
     if (n) return [n boolValue];
 
-    // 缓存里没有：直读一次
     NSDictionary *fresh = [NSDictionary dictionaryWithContentsOfFile:kPlistPath];
     NSNumber *fn = fresh ? fresh[kUserDisableKey] : nil;
     if (fn) return [fn boolValue];
@@ -799,7 +779,6 @@ static BOOL vl_is_private_format(OSType fmt) {
 
 // ══════════════════════════════════════════════════════════════════════
 //  LiteCore
-//  ★ FIX-X: enabled 只有 vid 消失 或 userExplicitDisable=YES 才禁用
 // ══════════════════════════════════════════════════════════════════════
 @interface LiteCore : NSObject
 + (instancetype)shared;
@@ -825,7 +804,7 @@ static BOOL vl_is_private_format(OSType fmt) {
     int _rotCacheDeg;
     NSLock *_rotLock;
 
-    int _consecutiveNO;
+    int _vidMissingCount;   // ★ FIX-Y4
 }
 
 + (instancetype)shared {
@@ -849,7 +828,7 @@ static BOOL vl_is_private_format(OSType fmt) {
         _rotCacheDeg = 0;
         _rotLock = [NSLock new];
 
-        _consecutiveNO = 0;
+        _vidMissingCount = 0;
     }
     return self;
 }
@@ -868,20 +847,30 @@ static BOOL vl_is_private_format(OSType fmt) {
         return r;
     }
     _lastCheck = now;
+
+    // ★ FIX-Y4: vid 5 次防抖
+    // 场景：DCIM 目录被系统短暂锁定时 fileExistsAtPath 可能返回 NO
+    BOOL vid = [[NSFileManager defaultManager] fileExistsAtPath:kVideoPath];
+    if (!vid) {
+        _vidMissingCount++;
+        if (_vidMissingCount < 5 && _enabledCache) {
+            vid = YES;   // 保留上次 YES（2.5 秒窗口）
+        }
+    } else {
+        _vidMissingCount = 0;
+    }
     os_unfair_lock_unlock(&_coreLock);
 
-    BOOL vid = [[NSFileManager defaultManager] fileExistsAtPath:kVideoPath];
     BOOL userDisabled = vplist_userExplicitDisable();
 
-    // ★ FIX-X: 只有 vid 消失 或 用户明确禁用 才翻转
-    //   动作按钮 / plist 抖动 / 换视频过程中的瞬时窗口 都不会影响
+    // v2.3.4 决策：vid 消失 或 用户明确禁用 → 关；否则开
     BOOL en;
     if (!vid) {
-        en = NO;              // 视频文件不存在 → 立即禁用
+        en = NO;
     } else if (userDisabled) {
-        en = NO;              // 用户明确禁用 → 立即禁用
+        en = NO;
     } else {
-        en = YES;             // 其他一切情况 → 保持启用
+        en = YES;
     }
 
     BOOL shouldStart = NO, shouldStop = NO;
@@ -1090,6 +1079,7 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
+// ★ FIX-Y2: ShouldNotPropagate → ShouldPropagate
 __attribute__((used))
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     static _Atomic int sCnt = 0;
@@ -1108,8 +1098,9 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
                                      CFGetTypeID(processed) == CFBooleanGetTypeID() &&
                                      CFBooleanGetValue((CFBooleanRef)processed));
             if (!alreadyProcessed && [LiteCore.shared enabled]) {
+                // ★ FIX-Y2
                 CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
-                                kCMAttachmentMode_ShouldNotPropagate);
+                                kCMAttachmentMode_ShouldPropagate);
                 @try {
                     [LiteCore.shared checkActionFromPlist];
                     SEL mtSel = sel_registerName("mediaType");
@@ -1130,6 +1121,7 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     if (orig) ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
 }
 
+// ★ FIX-Y2 + FIX-Y3: ShouldPropagate + 加 checkActionFromPlist
 __attribute__((used))
 static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     static _Atomic int sCnt2 = 0;
@@ -1148,9 +1140,12 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
                                      CFGetTypeID(processed) == CFBooleanGetTypeID() &&
                                      CFBooleanGetValue((CFBooleanRef)processed));
             if (!alreadyProcessed) {
+                // ★ FIX-Y2
                 CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
-                                kCMAttachmentMode_ShouldNotPropagate);
+                                kCMAttachmentMode_ShouldPropagate);
                 @try {
+                    // ★ FIX-Y3: 也检查动作
+                    [LiteCore.shared checkActionFromPlist];
                     NSString *cls = NSStringFromClass(object_getClass(_self));
                     [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
                 }
@@ -1650,14 +1645,11 @@ static void *install_thread(void *arg) {
     _pageTime = nil;
 }
 
-// ★ FIX-W: 禁用/启用相机 → 同时写 userExplicitDisable
 - (void)toggleEnabled:(UIButton *)b {
     BOOL en = vplist_enabled();
     BOOL newEn = !en;
     vplist_update(^(NSMutableDictionary *d) {
         d[kEnableKey] = @(newEn);
-        // userExplicitDisable = 用户明确禁用的标记
-        // 禁用时 = YES，启用时 = NO
         d[kUserDisableKey] = @(!newEn);
     });
     [b setTitle:(!newEn ? @"禁用相机" : @"启用相机") forState:UIControlStateNormal];
@@ -1695,10 +1687,9 @@ static void *install_thread(void *arg) {
         NSError *cpErr = nil;
         if ([[NSFileManager defaultManager] copyItemAtPath:url.path toPath:dst error:&cpErr]) {
             vlog(@"ui", @"video copied");
-            // ★ FIX-W: 换视频时启用 + 清除用户禁用标记
             vplist_update(^(NSMutableDictionary *d) {
                 d[kEnableKey] = @YES;
-                d[kUserDisableKey] = @NO;      // 清除用户禁用标记
+                d[kUserDisableKey] = @NO;
                 NSNumber *oldTok = d[kActionToken];
                 d[kActionToken] = @([oldTok longLongValue] + 1);
                 d[kActionActive] = @0;
@@ -1710,13 +1701,11 @@ static void *install_thread(void *arg) {
     }];
 }
 
-// ★ FIX-W: 动作按钮不再改动 userExplicitDisable
 - (void)triggerAction:(int)act {
     vplist_update(^(NSMutableDictionary *d) {
         NSNumber *oldTok = d[kActionToken];
         d[kActionToken] = @([oldTok longLongValue] + 1);
         d[kActionActive] = @(act);
-        // 不动 userExplicitDisable 和 enabled
     });
     vlog(@"ui", @"action triggered act=%d", act);
 }
@@ -1783,7 +1772,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.4", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.5", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1794,7 +1783,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.4", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.5", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
