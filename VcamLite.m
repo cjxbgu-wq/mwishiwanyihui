@@ -1,5 +1,5 @@
 //
-//  VcamLite.m — 融合版相机替换内核 v2.3.5
+//  VcamLite.m — 融合版相机替换内核 v2.3.6
 //  v2.3：私有 Lossy 格式直转 + render 去重 + VT session 锁 + 私有格式 srcID 缓存
 //  v2.3.1：FIX-P/Q/R/S
 //  v2.3.2：FIX-T (vplist_enabled lastKnown) + FIX-U (enabled 防抖)
@@ -10,6 +10,9 @@
 //        FIX-Y2  ShouldNotPropagate → ShouldPropagate（去重）
 //        FIX-Y3  vl_render_body 也调用 checkActionFromPlist
 //        FIX-Y4  enabled 的 vid 加 5 次防抖（DCIM 目录繁忙时 fileExistsAtPath 瞬时失败）
+//  v2.3.6（针对"扫一扫画面冻结/下游重复处理"）：
+//        FIX-Z1  LiteProcessor.transfer 私有格式移除 srcID 缓存跳过，强制每帧 VT 传输
+//        FIX-Z2  vl_emit_body / vl_render_body 调整 CMSetAttachment 时序（先贴标再判 enabled）
 //
 
 #import <Foundation/Foundation.h>
@@ -677,30 +680,20 @@ static BOOL vl_is_private_format(OSType fmt) {
     return YES;
 }
 
+// ═══════════════════════════════════════════════════════════════════
+//  ★ FIX-Z1: 私有格式移除 srcID 缓存跳过，强制每帧 VT 传输
+// ═══════════════════════════════════════════════════════════════════
 - (BOOL)transfer:(CVPixelBufferRef)src srcID:(uint64_t)srcID into:(CVPixelBufferRef)dst {
     if (!src || !dst || !_sess) return NO;
     size_t dw = CVPixelBufferGetWidth(dst);
     size_t dh = CVPixelBufferGetHeight(dst);
     OSType fmt = CVPixelBufferGetPixelFormatType(dst);
 
+    // ═══ FIX-Z1: 私有格式处理 (移除 srcID 缓存跳过) ═══
+    // 原因：mediaserverd 会不断向同一个 IOSurface 写入新的相机数据，
+    //      即使 srcID 没变（FROZEN 状态），也必须重新传输覆盖 dst，
+    //      否则微信扫一扫等实时预览会冻结在上一帧。
     if (vl_is_private_format(fmt)) {
-        IOSurfaceRef surf = CVPixelBufferGetIOSurface(dst);
-        uint32_t surfID = surf ? IOSurfaceGetID(surf) : 0;
-        NSNumber *cacheKey = @(surfID);
-
-        [_lock lock];
-        LitePrivateCache *pc = _privateCache[cacheKey];
-        if (pc && pc.srcID == srcID && srcID != 0) {
-            [_lock unlock];
-            return YES;
-        }
-        if (!pc) {
-            pc = [LitePrivateCache new];
-            pc.iosurfaceID = surfID;
-            _privateCache[cacheKey] = pc;
-        }
-        [_lock unlock];
-
         [_vtLock lock];
         OSStatus s = VTPixelTransferSessionTransferImage(_sess, src, dst);
         if (s != noErr && _slowSess) {
@@ -708,21 +701,7 @@ static BOOL vl_is_private_format(OSType fmt) {
         }
         [_vtLock unlock];
 
-        if (s == noErr) {
-            [_lock lock];
-            pc.srcID = srcID;
-            pc.lastUse = CFAbsoluteTimeGetCurrent();
-            if (_privateCache.count > 64) {
-                CFAbsoluteTime cutoff = CFAbsoluteTimeGetCurrent() - 10.0;
-                NSMutableArray *toRemove = [NSMutableArray array];
-                for (NSNumber *k in _privateCache) {
-                    if (_privateCache[k].lastUse < cutoff) [toRemove addObject:k];
-                }
-                [_privateCache removeObjectsForKeys:toRemove];
-            }
-            [_lock unlock];
-        }
-
+        // 首次格式日志（不影响控制流，仅用于诊断）
         static NSMutableSet<NSNumber *> *sSeen = nil;
         static NSLock *sSeenLock = nil;
         static dispatch_once_t once;
@@ -742,6 +721,7 @@ static BOOL vl_is_private_format(OSType fmt) {
         return s == noErr;
     }
 
+    // ═══ 标准格式处理 (保持不变) ═══
     NSString *key = [NSString stringWithFormat:@"%zu_%zu_%u", dw, dh, (unsigned)fmt];
 
     [_lock lock];
@@ -1079,7 +1059,8 @@ static IMP orig_imp_for_instance(id _self) {
     return NULL;
 }
 
-// ★ FIX-Y2: ShouldNotPropagate → ShouldPropagate
+// ★ FIX-Y2: ShouldNotPropagate → ShouldPropagate（去重）
+// ★ FIX-Z2: CMSetAttachment 时序 → 先贴标再判 enabled/替换
 __attribute__((used))
 static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
     static _Atomic int sCnt = 0;
@@ -1093,35 +1074,49 @@ static void vl_emit_body(id _self, SEL _cmd, CMSampleBufferRef sb) {
 
     @autoreleasepool {
         if (sb) {
+            // FIX-Z2: 先检查标记，无论 enabled 与否都先标记，防止下游重复处理
             CFTypeRef processed = CMGetAttachment(sb, kVLProcessedKey, NULL);
             BOOL alreadyProcessed = (processed != NULL &&
                                      CFGetTypeID(processed) == CFBooleanGetTypeID() &&
                                      CFBooleanGetValue((CFBooleanRef)processed));
-            if (!alreadyProcessed && [LiteCore.shared enabled]) {
-                // ★ FIX-Y2
+
+            if (!alreadyProcessed) {
+                // 立即标记为已处理
                 CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
                                 kCMAttachmentMode_ShouldPropagate);
-                @try {
-                    [LiteCore.shared checkActionFromPlist];
-                    SEL mtSel = sel_registerName("mediaType");
-                    BOOL isVideo = YES;
-                    if ([_self respondsToSelector:mtSel]) {
-                        uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
-                        if (mt != 'vide') isVideo = NO;
+
+                // 然后再检查是否 enabled
+                if ([LiteCore.shared enabled]) {
+                    @try {
+                        [LiteCore.shared checkActionFromPlist];
+                        SEL mtSel = sel_registerName("mediaType");
+                        BOOL isVideo = YES;
+                        if ([_self respondsToSelector:mtSel]) {
+                            uint32_t mt = ((uint32_t(*)(id,SEL))objc_msgSend)(_self, mtSel);
+                            if (mt != 'vide') isVideo = NO;
+                        }
+                        if (isVideo) {
+                            NSString *cls = NSStringFromClass(object_getClass(_self));
+                            [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+                        }
+                    } @catch (NSException *e) {
+                        vlog(@"emit", @"exc: %@", e);
                     }
-                    if (isVideo) {
-                        NSString *cls = NSStringFromClass(object_getClass(_self));
-                        [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
-                    }
-                } @catch (NSException *e) { vlog(@"emit", @"exc: %@", e); }
+                }
             }
         }
     }
+
+    // 调用原始实现
     IMP orig = orig_imp_for_instance(_self);
-    if (orig) ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
+    if (orig) {
+        ((void(*)(id,SEL,CMSampleBufferRef))orig)(_self, _cmd, sb);
+    }
 }
 
-// ★ FIX-Y2 + FIX-Y3: ShouldPropagate + 加 checkActionFromPlist
+// ★ FIX-Y2: ShouldPropagate（去重）
+// ★ FIX-Y3: render 也调用 checkActionFromPlist
+// ★ FIX-Z2: CMSetAttachment 时序 → 先贴标再判 enabled/替换
 __attribute__((used))
 static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     static _Atomic int sCnt2 = 0;
@@ -1134,27 +1129,38 @@ static void vl_render_body(id _self, SEL _cmd, CMSampleBufferRef sb, id input) {
     }
 
     @autoreleasepool {
-        if (sb && [LiteCore.shared enabled]) {
+        if (sb) {
+            // FIX-Z2: 先检查标记
             CFTypeRef processed = CMGetAttachment(sb, kVLProcessedKey, NULL);
             BOOL alreadyProcessed = (processed != NULL &&
                                      CFGetTypeID(processed) == CFBooleanGetTypeID() &&
                                      CFBooleanGetValue((CFBooleanRef)processed));
+
             if (!alreadyProcessed) {
-                // ★ FIX-Y2
+                // 立即标记为已处理
                 CMSetAttachment(sb, kVLProcessedKey, kCFBooleanTrue,
                                 kCMAttachmentMode_ShouldPropagate);
-                @try {
-                    // ★ FIX-Y3: 也检查动作
-                    [LiteCore.shared checkActionFromPlist];
-                    NSString *cls = NSStringFromClass(object_getClass(_self));
-                    [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+
+                // 然后再检查是否 enabled
+                if ([LiteCore.shared enabled]) {
+                    @try {
+                        // FIX-Y3: render 也检查动作
+                        [LiteCore.shared checkActionFromPlist];
+                        NSString *cls = NSStringFromClass(object_getClass(_self));
+                        [LiteCore.shared replaceInPlace:sb from:[cls UTF8String]];
+                    } @catch (NSException *e) {
+                        vlog(@"render", @"exc: %@", e);
+                    }
                 }
-                @catch (NSException *e) { vlog(@"render", @"exc: %@", e); }
             }
         }
     }
+
+    // 调用原始实现
     IMP orig = orig_imp_for_instance(_self);
-    if (orig) ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, input);
+    if (orig) {
+        ((void(*)(id,SEL,CMSampleBufferRef,id))orig)(_self, _cmd, sb, input);
+    }
 }
 
 __attribute__((used))
@@ -1772,7 +1778,7 @@ static void vcamLite_init(void) {
     @autoreleasepool {
         NSString *proc = [NSProcessInfo processInfo].processName;
         if ([proc isEqualToString:@"mediaserverd"]) {
-            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.5", getpid());
+            vlog_always(@"init", @"loaded in mediaserverd pid=%d build=v2.3.6", getpid());
             (void)[LiteCore shared];
             pthread_t th;
             pthread_attr_t attr;
@@ -1783,7 +1789,7 @@ static void vcamLite_init(void) {
             return;
         }
         if ([proc isEqualToString:@"SpringBoard"]) {
-            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.5", getpid());
+            vlog_always(@"init", @"loaded in SpringBoard pid=%d build=v2.3.6", getpid());
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC),
                            dispatch_get_main_queue(), ^{
                 [[VLBall shared] show];
